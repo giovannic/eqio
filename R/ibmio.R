@@ -3,7 +3,10 @@ node <- as.numeric(args[1])
 n_batches <- as.numeric(args[2])
 batch_size <- as.numeric(args[3])
 seed <- as.numeric(args[4])
-out_dir <- args[5]
+tolerance <- as.numeric(args[5])
+max_t <- as.numeric(args[6])
+n_pop <- as.numeric(args[7])
+out_dir <- args[8]
 
 n <- n_batches * batch_size
 
@@ -65,21 +68,20 @@ process <- function(row) {
   )
   p$g <- as.numeric(row[c('g1', 'g2', 'g3')])
   p$h <- as.numeric(row[c('h1', 'h2', 'h3')])
-  n_pop <- 1e5
   p$human_population <- n_pop
-  max_t <- 500 * 365
-  tolerance <- .5
   params <- malariasimulation::get_parameters(p)
+  params$individual_mosquitoes <- FALSE
   params <- malariasimulation::set_equilibrium(params, row[['init_EIR']])
   tryCatch({
       output <- malariasimulation:::run_simulation_until_stable(
         params,
         tolerance = tolerance,
         max_t = max_t,
-        post_t = 365
+        post_t = 365,
+	post_parameters = function(t) params
       )
       baseline <- mean(output$post$EIR_All) / n_pop * 365
-      prev <- output$post$n_detect_720_3650 / output$post$n_720_3650
+      prev <- as.numeric(output$post[,'n_detect_730_3650'] / output$post[,'n_730_3650'])
       outputs <- c(prev, baseline)
       names(outputs) <- c(paste0('prev_', seq(365)), 'EIR')
       return(outputs)
