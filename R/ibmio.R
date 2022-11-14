@@ -60,17 +60,19 @@ sample_params <- function(n, paramset) {
 }
 
 process <- function(row) {
-  p <- row[!(names(row) %in% c('init_EIR', 'g1', 'g2', 'g3', 'h1', 'h2', 'h3'))]
-  p$g <- row[c('g1', 'g2', 'g3')]
-  p$h <- row[c('h1', 'h2', 'h3')]
+  p <- as.list(
+    row[!(names(row) %in% c('init_EIR', 'g1', 'g2', 'g3', 'h1', 'h2', 'h3'))]
+  )
+  p$g <- as.numeric(row[c('g1', 'g2', 'g3')])
+  p$h <- as.numeric(row[c('h1', 'h2', 'h3')])
   n_pop <- 1e5
   p$human_population <- n_pop
   max_t <- 500 * 365
-  tolerance <- 1e-2
+  tolerance <- .5
   params <- malariasimulation::get_parameters(p)
-  params <- malariasimulation::set_equilibrium(row$init_EIR)
+  params <- malariasimulation::set_equilibrium(params, row[['init_EIR']])
   tryCatch({
-      output <- malariasimulation::run_simulation_until_stable(
+      output <- malariasimulation:::run_simulation_until_stable(
         params,
         tolerance = tolerance,
         max_t = max_t,
