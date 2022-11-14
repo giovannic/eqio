@@ -3,53 +3,64 @@ node <- as.numeric(args[1])
 n_batches <- as.numeric(args[2])
 batch_size <- as.numeric(args[3])
 seed <- as.numeric(args[4])
-seasonality_file <- args[5]
-out_dir <- args[6]
+out_dir <- args[5]
 
 n <- n_batches * batch_size
 
 set.seed(seed)
 
-all_params <- list(
-  init_EIR = list(min=0, max=100),
-  eta = list(min=1/(40 * 365), max=1/(20 * 365)),
-  Q0 = list(min=0, max=1),
-  sigma2 = list(min=1, max=3),
-  rU = list(min=1/100, max=1/30),
-  cT = list(min=0, max=1),
-  cD = list(min=0, max=1),
-  gamma1 = list(min=0.01, max=10),
-  cU = list(min=0, max=1),
-  kB = list(min=0.01, max=10),
-  uB = list(min=1, max=10),
-  uCA = list(min=1, max=10),
-  uD = list(min=1, max=10),
-  kC = list(min=0.01, max=10),
-  b0 = list(min=0.01, max=0.99),
-  b1_prop = list(min=0, max=1),
-  IB0 = list(min=1, max=100),
-  IC0 = list(min=1, max=100)
-)
-
-sample_df <- function(df, n) {
-  df[sample(nrow(df), n, replace = TRUE), ]
-}
+basic_params <- data.frame(do.call(
+  'rbind',
+  list(
+    list(name='init_EIR', min=0, max=100),
+    list(name='eta', min=1/(40 * 365), max=1/(20 * 365)),
+    list(name='Q0', min=0, max=1),
+    list(name='sigma2', min=1, max=3),
+    list(name='rU', min=1/1000, max=1/30),
+    list(name='cD', min=0, max=1),
+    list(name='gamma1', min=0.01, max=10),
+    list(name='cU', min=0, max=1),
+    list(name='kB', min=0.01, max=10),
+    list(name='uB', min=1, max=10),
+    list(name='uCA', min=1, max=10),
+    list(name='uD', min=1, max=10),
+    list(name='kC', min=.01, max=10),
+    list(name='b0', min=.01, max=.99),
+    list(name='b1', min=.01, max=.99),
+    list(name='IB0', min=1, max=100),
+    list(name='IC0', min=1, max=100),
+    list(name='delayMos', min=1, max=20),
+    list(name='phi0', min=0, max=1),
+    list(name='phi1', min=0, max=1),
+    list(name='mu0', min=0, max=1),
+    list(name='fD0', min=0, max=1),
+    list(name='aD', min=20 * 365, max=40 * 365),
+    list(name='gammaD', min=1, max=10),
+    list(name='ssa0', min=-10, max=10),
+    list(name='ssa1', min=-10, max=10),
+    list(name='ssa2', min=-10, max=10),
+    list(name='ssa3', min=-10, max=10),
+    list(name='ssb1', min=-10, max=10),
+    list(name='ssb2', min=-10, max=10),
+    list(name='ssb3', min=-10, max=10)
+  )
+))
 
 sample_params <- function(n, paramset) {
-  r <- lhs::randomLHS(n, length(paramset))
+  r <- lhs::randomLHS(n, nrow(paramset))
   cols <- lapply(
-    seq_along(paramset),
+    seq(nrow(paramset)),
     function(i) {
-      qunif(r[,i], min=paramset[[i]]$min, max=paramset[[i]]$max)
+      qunif(r[,i], min=paramset[[i, 'min']], max=paramset[[i, 'max']])
     }
   )
-  names(cols) <- names(paramset)
+
+  names(cols) <- paramset[,'name']
   data.frame(cols)
 }
 
 process <- function(row) {
-  p <- row[names(row) != 'b1_prop']
-  p['b1'] <- row['b0'] * row['b1_prop']
+  p <- row
   p['max_t'] <- 500 * 365
   p['tolerance'] <- 1e-2
   tryCatch({
@@ -69,10 +80,7 @@ process <- function(row) {
   )
 }
 
-samples <- sample_params(n, all_params)
-seasonality <- read.csv(seasonality_file)
-names(seasonality) <- c('ssa0', 'ssa1', 'ssa2', 'ssa3', 'ssb1', 'ssb2', 'ssb3')
-samples <- cbind(samples, sample_df(seasonality, n))
+samples <- sample_params(n, basic_params)
 
 batches <- split(
   seq(nrow(samples)),
