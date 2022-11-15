@@ -71,6 +71,7 @@ process <- function(row) {
   p$human_population <- n_pop
   params <- malariasimulation::get_parameters(p)
   params$individual_mosquitoes <- FALSE
+  params$model_seasonality <- TRUE
   params <- malariasimulation::set_equilibrium(params, row[['init_EIR']])
   tryCatch({
       output <- malariasimulation:::run_simulation_until_stable(
