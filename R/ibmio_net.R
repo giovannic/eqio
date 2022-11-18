@@ -74,6 +74,7 @@ process <- function(row) {
   p$human_population <- n_pop
   params <- malariasimulation::get_parameters(p)
   params$individual_mosquitoes <- FALSE
+  params$model_seasonality <- TRUE
   params <- malariasimulation::set_equilibrium(params, row[['init_EIR']])
   post_warmup_parameters <- function(warmup) {
     params <- malariasimulation::set_bednets(

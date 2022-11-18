@@ -79,7 +79,7 @@ process <- function(row) {
         tolerance = tolerance,
         max_t = max_t,
         post_t = 365,
-	post_parameters = function(t) params
+        post_parameters = function(t) params
       )
       baseline <- mean(output$post$EIR_All) / n_pop * 365
       prev <- as.numeric(output$post[,'n_detect_730_3650'] / output$post[,'n_730_3650'])
