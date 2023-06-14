@@ -16,15 +16,18 @@ kernelspec:
 
  * mox development
    * ~make python package~
-   * write tests
+   * ~write tests~
    * ~build documentation~
-   * make homepage
+   * ~make homepage~
    * ~translate this notebook to jupytext~
-   * use mox primitives
- * investigate du -> rU
- * investigate cu/cd -> cU/cD
+   * ~use mox primitives?~
+ * ~investigate du -> rU~
+ * ~investigate cu/cd -> cU/cD~
  * investigate feature learning and context decoders
+   * or the alternative loss function where you aggregate the output?
  * investigate robust training
+   * regularisation (dropout/ l2)
+   * gradient towards high loss
  * investigate history matching
 
 ```{code-cell} ipython3
@@ -38,6 +41,7 @@ from jax import random, jit, vmap
 
 ```{code-cell} ipython3
 import dmeq
+from mox.sampling import LHSStrategy
 ```
 
 ```{code-cell} ipython3
@@ -63,20 +67,27 @@ def full_solution(params, eir, eta):
         p[k] = v
     p['EIR'] = eir
     p['eta'] = eta
-    return dmeq.solve(p, dtype=jnp.float64)
+    s = dmeq.solve(p, dtype=jnp.float64)
+    return {
+        'pos_M': s[0],
+        'inc': s[1],
+        'prob_b': s[3],
+        'prob_c': s[4],
+        'prob_d': s[5],
+        'prop': s[2],
+    }
 ```
 
 ```{code-cell} ipython3
 population = 1_000_000
 prev_N = 1_000
 
-def prev_stats(params, eir, eta, impl=full_solution):
-    solution = impl(params, eir, eta)
-    inc_rates = solution[1] * solution[-1] * population
+def prev_stats(solution):
+    inc_rates = solution['inc'] * solution['prop'] * population
     return (
         jnp.array([
-            solution[0, 3:10].sum() / solution[-1, 3:10].sum(), # Prev 2 - 10
-            solution[0, 10:].sum() / solution[-1, 10:].sum(), # Prev 10+
+            solution['pos_M'][3:10].sum() / solution['prop'][3:10].sum(), # Prev 2 - 10
+            solution['pos_M'][10:].sum() / solution['prop'][10:].sum(), # Prev 10+
         ]),
         jnp.array([
             inc_rates[:5].sum(), # Inc 0 - 5
@@ -87,7 +98,10 @@ def prev_stats(params, eir, eta, impl=full_solution):
 ```
 
 ```{code-cell} ipython3
-prev_stats_multisite = vmap(prev_stats, in_axes=[None, 0, 0, None])
+prev_stats_multisite = vmap(
+    lambda params, eta, eir, impl: prev_stats(impl(params, eta, eir)),
+    in_axes=[None, 0, 0, None]
+)
 ```
 
 ```{code-cell} ipython3
@@ -126,11 +140,11 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
         high=40. * 365.
     ))
     
-    du = numpyro.sample('du', dist.LeftTruncatedDistribution(dist.Cauchy(50., 1.), low=0.))
+    ru = numpyro.sample('rU', dist.LogNormal(0., .25))
     
     # FOIM
-    cd = numpyro.sample('cd', dist.Beta(1., 2.))
-    cu = numpyro.sample('cu', dist.Beta(1., 5.))
+    cd = numpyro.sample('cD', dist.Beta(1., 2.))
+    cu = numpyro.sample('cU', dist.Beta(1., 5.))
     g_inf = numpyro.sample('g_inf', dist.Gamma(3., 1.))
     
     prev_stats, inc_stats = impl({
@@ -152,11 +166,12 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
         'fd0': fd0,
         'gd': gd,
         'ad0': ad0,
-        'rU': 1. / du,
+        'rU': ru,
         'cD': cd,
         'cU': cu,
         'g_inf': g_inf
     }, EIRs, etas)
+    
     numpyro.sample(
         'obs_prev',
         dist.Independent(
@@ -165,10 +180,11 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
         ),
         obs=prev
     )
+
     numpyro.sample(
         'obs_inc',
         dist.Independent(
-            dist.Poisson(rate=inc_stats),
+            dist.Poisson(rate=inc_stats, validate_args=True),
             1
         ),
         obs=inc
@@ -211,26 +227,13 @@ import jax
 import pandas as pd
 from scipy.stats.qmc import LatinHypercube
 
-train_samples = int(1e5)
+train_samples = int(1e4)
 device_count = len(jax.devices())
 ```
 
 ```{code-cell} ipython3
-# Create the X_prior dataset
-
-def pmap_prior(k):
-    return Predictive(model, num_samples=train_samples // cpu_count)(k)
-
-key, *keys = random.split(key, num=cpu_count + 1)
-train_prior = pmap(pmap_prior, in_axes=0, devices=jax.devices('cpu'))(jnp.stack(keys))
-train_prior = jax.tree_map(lambda x: jnp.reshape(x, (train_samples, -1)), train_prior)
-X_prior, x_def = jax.tree_util.tree_flatten(without_obs(train_prior))
-X_prior = jnp.concatenate(X_prior, axis=1)
-```
-
-```{code-cell} ipython3
 # Create the X_lhs dataset
-bounds = pd.DataFrame.from_records([
+intrinsic_bounds = pd.DataFrame.from_records([
     ('kb', 0, 10),
     ('ub', 0, 10),
     ('b0', 0, 1),
@@ -249,462 +252,220 @@ bounds = pd.DataFrame.from_records([
     ('fd0', 0, 1),
     ('gd', 0, 10),
     ('ad0', 20 * 365, 40 * 365),
-    ('du', 0, 100),
-    ('cd', 0, 1),
-    ('cu', 0, 1),
+    ('rU', 0, 1/100),
+    ('cD', 0, 1),
+    ('cU', 0, 1),
     ('g_inf', 0, 10)
 ], columns=['name', 'lower', 'upper'])
 
-sampler = LatinHypercube(d=len(bounds), seed=42)
-samples = sampler.random(train_samples)
-ordered_bounds = bounds.set_index('name').loc[pd.Series(without_obs(train_prior).keys())]
-
-X_lhs = samples * (
-    ordered_bounds.upper - ordered_bounds.lower
-).to_numpy() + ordered_bounds.lower.to_numpy()
-```
-
-```{code-cell} ipython3
-# Sample site parameters
-
-site_bounds = pd.DataFrame.from_records([
-    ('EIR', 0., 500.),
-    ('eta', 1/(40 * 365), 1/(20 * 365))
-], columns=['name', 'lower', 'upper'])
-sampler = LatinHypercube(d=len(site_bounds), seed=42)
-X_site = sampler.random(train_samples)
-X_site = X_site * (site_bounds.upper - site_bounds.lower).to_numpy() + site_bounds.lower.to_numpy()
-```
-
-```{code-cell} ipython3
-print(pd.concat([site_bounds, bounds]).to_latex(index=False, float_format="{:0.0f}".format))
-```
-
-```{code-cell} ipython3
-key_i, key = random.split(key)
-order = random.choice(key_i, EIRs.shape[0], (train_samples,), replace=True)
-X_site_fixed = jnp.concatenate([
-    EIRs[order, jnp.newaxis],
-    etas[order, jnp.newaxis]
-], axis=1)
-```
-
-```{code-cell} ipython3
-# Sample full y
-def sample_full_y(x, x_site):
-    params = jax.tree_util.tree_unflatten(x_def, x)
-    return full_solution(params, x_site[0], x_site[1])
-
-def sample_y_from_x(x, x_site, impl):
-    y = pmap(vmap(impl), devices=jax.devices('cpu'))(
-        jnp.reshape(x, (cpu_count, x.shape[0] // cpu_count,) + x.shape[1:]),
-        jnp.reshape(x_site, (cpu_count, x_site.shape[0] // cpu_count,) + x_site.shape[1:])
-    )
-    y_shape = y.shape[2:]
-    return (jnp.reshape(y, (train_samples,) + y_shape), y_shape)
-
-y_prior_full, y_shape = sample_y_from_x(X_prior, X_site, sample_full_y)
-y_lhs_full, y_shape = sample_y_from_x(X_lhs, X_site, sample_full_y)
-y_lhs_full_fixed_site, y_shape = sample_y_from_x(X_lhs, X_site_fixed, sample_full_y)
-
-# sample fixed y
-def sample_fixed_y(x, x_site):
-    params = jax.tree_util.tree_unflatten(x_def, x)
-    return jnp.concatenate(prev_stats_multisite(params, EIRs, etas, full_solution), axis=1)
-
-y_prior_fixed , y_shape_fixed = sample_y_from_x(X_lhs, X_site, sample_fixed_y)
-y_lhs_fixed , y_shape_fixed = sample_y_from_x(X_lhs, X_site, sample_fixed_y)
-```
-
-```{code-cell} ipython3
-def split(x, split):
-    return (x[:split], x[split:])
-
-val_split = int(.8 * train_samples)
-
-def standardise(x, mean, std):
-    return (x - mean) / std
-
-def inverse_standardise(x, mean, std):
-    return x * std + mean
-
-def adapt(x, x_val, axis):
-    mean, std = jnp.mean(x, axis=axis, keepdims=True), jnp.std(x, axis=axis, keepdims=True)
-    return (standardise(x, mean, std), standardise(x_val, mean, std), mean, std)
-
-datasets = {
-    'X_prior': (X_prior, 0),
-    'X_lhs': (X_lhs, 0),
-    'X_site': (X_site, 0),
-    'X_site_fixed': (X_site_fixed, 0),
-    'y_prior_full': (y_prior_full, (0, 2)),
-    'y_lhs_full': (y_lhs_full, (0, 2)),
-    'y_lhs_full_fixed_site': (y_lhs_full_fixed_site, (0, 2)),
-    # 'y_prior_full': (y_prior_full, 0),
-    # 'y_lhs_full': (y_lhs_full, 0),
-    'y_prior_fixed': (y_prior_fixed, 0),
-    'y_lhs_fixed': (y_lhs_fixed, 0)
-}
-
-def process_dataset(x, axis):
-    x, x_val = split(x, val_split)
-    return adapt(x, x_val, axis)
-
-datasets = { k: process_dataset(*v) for k, v in datasets.items()}
-```
-
-```{code-cell} ipython3
-from flax import linen as nn
-from jax.nn import softplus
-import optax
-from jax import value_and_grad
-from jaxtyping import Array
-```
-
-```{code-cell} ipython3
-def maskedminmaxrelu(x, min_x, max_x, idx):
-    '''relu with a min and max, however max_x is only set at idx'''
-    filtered_min = jnp.maximum(x, min_x)
-    filtered_max = jnp.minimum(filtered_min, max_x)
-    return filtered_min.at[idx].set(filtered_max[idx])
-
-class MaskedMinMaxSurrogate(nn.Module):
-    units: int
-    n_hidden: int
-    n_output: int
-    y_min: Array
-    y_max: Array
-    idx_max: Array
-
-    @nn.compact
-    def __call__(self, x):
-        layers = [nn.Dense(self.units) for _ in range(self.n_hidden)]
-        for i, lyr in enumerate(layers):
-            x = lyr(x)
-            x = nn.relu(x)
-        x = nn.Dense(self.n_output)(x)
-        return maskedminmaxrelu(x, self.y_min, self.y_max, self.idx_max)
-
-def l2_loss(x, alpha):
-    return alpha * (x ** 2).mean()
-
-def log_cosh(model, params, x_batched, y_batched):
-    # Define a numerically stable log cosh for a single pair (x,y)
-    def error(x, y):
-        pred = model.apply(params, x)
-        diff = y - pred
-        return jnp.mean(diff + softplus(-2 * diff) - jnp.log(2.))
-
-    # Regularisation loss
-    reg_loss = sum(
-        l2_loss(w, alpha=0.001)
-        for w in jax.tree_util.tree_leaves(params)
-    )
-
-    # Vectorize the previous to compute the average of the loss on all samples.
-    return jnp.mean(vmap(error)(x_batched, y_batched), axis=0) + reg_loss
-```
-
-```{code-cell} ipython3
-def make_surrogate(key, X, X_val, y, y_shape, idx_max):
-    y, y_val, y_mean, y_std = y
-    surrogate_model = MaskedMinMaxSurrogate(
-        units=288,
-        n_hidden=3,
-        n_output=jnp.product(jnp.array(y_shape)),
-        y_min=standardise(jnp.zeros(y_shape), y_mean, y_std)[0].reshape(-1),
-        y_max=standardise(jnp.ones(y_shape), y_mean, y_std)[0].reshape(-1),
-        idx_max=idx_max
-    )
-    surrogate_params = surrogate_model.init(key, X)
-
-    tx = optax.adam(learning_rate=.001)
-    opt_state = tx.init(surrogate_params)
-    loss_grad_fn = value_and_grad(jit(lambda p, x, y: log_cosh(surrogate_model, p, x, y)))
-
-    batch_size = 100
-
-    n_batches = X.shape[0] // batch_size
-    X_batched = jnp.reshape(X, (n_batches, batch_size, -1))
-    y_batched = jnp.reshape(y, (n_batches, batch_size, -1))
-
-    epochs = 100
-    
-    for i in range(epochs):
-        key, key_i = random.split(key)
-        
-        for b in random.permutation(key_i, n_batches, independent=True):
-            loss_val, grads = loss_grad_fn(
-                surrogate_params,
-                X_batched[b],
-                y_batched[b]
-            )
-            updates, opt_state = tx.update(grads, opt_state)
-            surrogate_params = optax.apply_updates(surrogate_params, updates)
-
-    return (surrogate_model, surrogate_params)
-```
-
-```{code-cell} ipython3
-def make_full_surrogate(key, x, x_site, y):
-    x, x_val = x[:2]
-    x_site, x_site_val = x_site[:2]
-
-    X = jnp.concatenate([x_site, x], axis=1)
-    X_val = jnp.concatenate([x_site_val, x_val], axis=1)
-    idx_max = jnp.arange(jnp.product(jnp.array(y_shape)))
-    return make_surrogate(
-        key,
-        X,
-        X_val,
-        y,
-        y_shape,
-        idx_max
-    )
-
-def make_fixed_surrogate(key, x, y):
-    x, x_val = x[:2]
-    idx_max = jnp.arange(jnp.product(jnp.array(y_shape_fixed)))
-    idx_max = jnp.reshape(idx_max.reshape(y_shape_fixed)[:,:2], -1)
-    return make_surrogate(
-        key,
-        x,
-        x_val,
-        y,
-        y_shape_fixed,
-        idx_max
-    )
-```
-
-```{code-cell} ipython3
-n_sample_points = 2
-
-def subsample(d, sample_size):
-    return {k: tuple([a[:sample_size] for a in v]) for k, v in datasets.items()}
-
-def surrogates_for_sample_size(key_i, sample_size):
-    print('sample_size:', sample_size)
-    d = subsample(datasets, sample_size)
-    
-    return {
-        'prior_full': make_full_surrogate(
-            key_i[0],
-            d['X_prior'],
-            d['X_site'],
-            d['y_prior_full']
-        ),
-        'lhs_full': make_full_surrogate(
-            key_i[1],
-            d['X_lhs'],
-            d['X_site'],
-            d['y_lhs_full']
-        ),
-        'prior_fixed': make_fixed_surrogate(
-            key_i[2],
-            d['X_prior'],
-            d['y_prior_fixed']
-        ),
-        'lhs_fixed': make_fixed_surrogate(
-            key_i[3],
-            d['X_lhs'],
-            d['y_lhs_fixed']
-        ),
-        'lhs_full_fixed_site': make_full_surrogate(
-            key_i[3],
-            d['X_lhs'],
-            d['X_site_fixed'],
-            d['y_lhs_full_fixed_site']
-        ),
-    }
-```
-
-```{code-cell} ipython3
-key, *key_i = random.split(key, num=4*n_sample_points + 1)
-sample_points = jnp.linspace(1000, train_samples, num=n_sample_points, dtype=jnp.int64)
-surrogates = [
-    surrogates_for_sample_size(keys, sample_size)
-    for keys, sample_size in
-    list(zip(
-        jnp.reshape(jnp.stack(key_i), (len(sample_points), 4, -1)),
-        [1000]#sample_points
-    ))
+lhs_parameter_space = [
+    {
+        name: LHSStrategy(lower, upper)
+        for name, lower, upper in intrinsic_bounds.itertuples(index=False)
+    },
+    LHSStrategy(0., 500.),
+    LHSStrategy(1/(40 * 365), 1/(20 * 365))
 ]
 ```
 
 ```{code-cell} ipython3
-sample_map = {k: 0 for k in without_obs(prior).keys()}
-
-def full_solution_surrogate(model, params, model_params, x, x_site, y, eir, eta):
-    X_site_mean, X_site_std = x_site[2:]
-    X_mean, X_std = x[2:]
-    y_mean, y_std = y[2:]
-    p = jnp.concatenate([
-        jnp.array([eir, eta]),
-        jax.flatten_util.ravel_pytree(model_params)[0]
-    ])
-    mean = jnp.concatenate([X_site_mean, X_mean], axis=1)
-    std = jnp.concatenate([X_site_std, X_std], axis=1)
-    y = model.apply(params, standardise(p, mean, std)[0])
-    return inverse_standardise(
-        jnp.reshape(y, y_shape),
-        y_mean,
-        y_std
-    )[0]
-
-pred_y_full = vmap(
-    lambda x, f: jnp.concatenate(prev_stats_multisite(x, EIRs, etas, f), axis=1),
-    [sample_map, None]
-)
-
-def fixed_solution_surrogate(model, params, model_params, x, y):
-    X_mean, X_std = x[2:]
-    y_mean, y_std = y[2:]
-    p = jax.flatten_util.ravel_pytree(model_params)[0]
-    y = model.apply(params, standardise(p, X_mean, X_std)[0])
-    return inverse_standardise(
-        jnp.reshape(y, y_shape_fixed),
-        y_mean,
-        y_std
-    )[0]
-
-pred_y_fixed = vmap(fixed_solution_surrogate, [None, None, sample_map, None, None])
+print(pd.concat([intrinsic_bounds]).to_latex(index=False, float_format="{:0.0f}".format))
 ```
 
 ```{code-cell} ipython3
-# calculate the loss in prev/incidence
-y = pred_y_full(without_obs(prior), full_solution)
+max_val = jnp.finfo(jnp.float32).max
+min_val = jnp.finfo(jnp.float32).min
 ```
 
 ```{code-cell} ipython3
-y_hat_prior_full = [pred_y_full(
-    without_obs(prior),
-    lambda p, e, a: full_solution_surrogate(
-        *s['prior_full'],
-        p,
-        datasets['X_prior'],
-        datasets['X_site'],
-        datasets['y_prior_full'],
-        e,
-        a,
-    )
-) for s in surrogates]
-
-y_hat_lhs_full = [pred_y_full(
-    without_obs(prior),
-    lambda p, e, a: full_solution_surrogate(
-        *s['lhs_full'],
-        p,
-        datasets['X_lhs'],
-        datasets['X_site'],
-        datasets['y_lhs_full'],
-        e,
-        a,
-    )
-) for s in surrogates]
-
-y_hat_lhs_full_fixed_site = [pred_y_full(
-    without_obs(prior),
-    lambda p, e, a: full_solution_surrogate(
-        *s['lhs_full_fixed_site'],
-        p,
-        datasets['X_lhs'],
-        datasets['X_site_fixed'],
-        datasets['y_lhs_full_fixed_site'],
-        e,
-        a,
-    )
-) for s in surrogates]
+from mox.sampling import sample
+from mox.surrogates import make_surrogate
+from mox.training import train_surrogate
+from mox.loss import mse
 ```
 
 ```{code-cell} ipython3
-y_hat_prior_fixed = [pred_y_fixed(
-    *s['prior_fixed'],
-    without_obs(prior),
-    datasets['X_prior'],
-    datasets['y_prior_fixed']
-) for s in surrogates]
+key_i, key = random.split(key)
+X_lhs_full = sample(lhs_parameter_space, train_samples, key_i)
+y_lhs_full = vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0])(*X_lhs_full)
 
-y_hat_lhs_fixed = [pred_y_fixed(
-    *s['lhs_fixed'],
-    without_obs(prior),
-    datasets['X_lhs'],
-    datasets['y_lhs_fixed']
-) for s in surrogates]
-```
-
-```{code-cell} ipython3
-import pandas as pd
-import seaborn as sns
-y_labels = ['prev2-10', 'prev10+', 'inc0-5', 'inc5-15', 'inc15+']
-```
-
-```{code-cell} ipython3
-y_hats = {
-    'prior_full': y_hat_prior_full,
-    'lhs_full': y_hat_lhs_full,
-    'prior_fixed': y_hat_prior_fixed,
-    'lhs_fixed': y_hat_lhs_fixed,
-    'lhs_full_fixed_site': y_hat_lhs_full_fixed_site
+y_min_full = {
+    'pos_M': jnp.full((100,), 0.),
+    'inc': jnp.full((100,), 0.),
+    'prob_b': jnp.full((100,), 0.),
+    'prob_c': jnp.full((100,), 0.),
+    'prob_d': jnp.full((100,), 0.),
+    'prop': jnp.full((100,), min_val)
 }
+
+y_max_full = {
+    'pos_M': jnp.full((100,), 1.),
+    'inc': jnp.full((100,), max_val),
+    'prob_b': jnp.full((100,), 1.),
+    'prob_c': jnp.full((100,), 1.),
+    'prob_d': jnp.full((100,), 1.),
+    'prop': jnp.full((100,), 1.)
+}
+
+surrogate_lhs_full = make_surrogate(
+    X_lhs_full,
+    y_lhs_full,
+    y_min=y_min_full,
+    y_max=y_max_full
+)
+key_i, key = random.split(key)
+params_lhs_full = train_surrogate(
+    X_lhs_full,
+    y_lhs_full,
+    surrogate,
+    mse,
+    key_i
+)
 ```
 
 ```{code-cell} ipython3
-df = pd.concat([
-    pd.DataFrame({
-        'samples': sample_points[u],
-        'RE': jnp.abs(y - y_hat[u])[:, i, j] / y[:, i, j],
-        'EIR': EIRs[i],
-        'output': y_labels[j],
-        'surrogate': s_label
-    })
-    for i in range(len(EIRs))
-    for j in range(len(y_labels))
-    for s_label, y_hat in y_hats.items()
-    for u in range(len(sample_points))
-])
+key_i, key = random.split(key)
+X_lhs_fixed = sample(lhs_parameter_space[0:1], train_samples, key_i)
+y_lhs_fixed = vmap(lambda p: prev_stats_multisite(p, EIRs, etas, full_solution), in_axes=[{n: 0 for n in intrinsic_bounds.name}])(*X_lhs_fixed)
+
+y_min_fixed = (0., 1e-12)
+y_max_fixed = (1., max_val)
+
+surrogate_lhs_fixed = make_surrogate(
+    X_lhs_fixed,
+    y_lhs_fixed,
+    y_min=y_min_fixed,
+    y_max=y_max_fixed
+)
+key_i, key = random.split(key)
+params_lhs_fixed = train_surrogate(
+    X_lhs_fixed,
+    y_lhs_fixed,
+    surrogate_lhs_fixed,
+    mse,
+    key_i
+)
+```
+
+# TODO:
+
+* convergence
+* ~approximation error~
+  * ~test sets: prior, space filling, surrogate posterior~
+  * ~observation PE plots~
+  * ~Relative Error for each output~
+* why negative on full??
+
+```{code-cell} ipython3
+from flax.linen.module import _freeze_attr
 ```
 
 ```{code-cell} ipython3
-df.EIR = df.EIR.astype(int)
+# Write function for validation set generation
+def full_solution_surrogate(surrogate, surrogate_params, params, eir, eta):
+    surrogate_input = _freeze_attr([params, eir, eta])
+    return surrogate.apply(surrogate_params, surrogate_input)
+
+def fixed_surrogate(surrogate, surrogate_params, params):
+    surrogate_input = _freeze_attr([params])
+    return surrogate.apply(surrogate_params, surrogate_input)
+
+def prev_stats_surrogate(*args):
+    return prev_stats(full_solution_surrogate(*args))
+
+def prev_stats_surrogate_batch(surrogate, surrogate_params, params):
+    f = lambda p, e, a: full_solution_surrogate(surrogate, surrogate_params, p, e, a)
+    return vmap(
+        lambda p, e, a: prev_stats_multisite(p, e, a, f),
+        in_axes=[{k: 0 for k in params.keys()}, None, None]
+    )(params, EIRs, etas)
+
+def prev_stats_fixed_surrogate_batch(surrogate, surrogate_params, params):
+    return vmap(
+        lambda p: fixed_surrogate(surrogate, surrogate_params, p),
+        in_axes=[{k: 0 for k in params.keys()}]
+    )(params)
+
+def sort_dict(d):
+    return {k: d[k] for k in intrinsic_bounds.name}
+
+def prev_stats_batch(params):
+    return vmap(
+        lambda p, e, a: prev_stats_multisite(p, e, a, full_solution),
+        in_axes=[{k: 0 for k in params.keys()}, None, None]
+    )(params, EIRs, etas)
 ```
 
 ```{code-cell} ipython3
-df.samples = df.samples.astype(int)
+val_size = int(1e4)
+y_val_prior = prev_stats_batch(without_obs(prior))
+y_val_prior_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, sort_dict(without_obs(prior)))
+y_val_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed, sort_dict(without_obs(prior)))
+
+key, key_i = random.split(key)
+X_val_lhs = sample(lhs_parameter_space[0], val_size, key_i)
+y_val_lhs = prev_stats_batch(X_val_lhs)
+y_val_lhs_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, X_val_lhs)
+y_val_lhs_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed, X_val_lhs)
 ```
 
 ```{code-cell} ipython3
-df[df.samples == 100000].groupby('surrogate').agg({'RE': ['mean', 'std']})
+def surrogate_posterior(surrogate, params):
+    def surrogate_impl(p, e, a):
+        return prev_stats_multisite(p, e, a, lambda p_, e_, a_: full_solution_surrogate(surrogate, params, sort_dict(p_), e_, a_))
+    n_samples = 100
+    n_warmup = 100
+
+    kernel = NUTS(model)
+
+    mcmc = MCMC(
+        kernel,
+        num_samples=n_samples,
+        num_warmup=n_warmup,
+        num_chains=n_chains,
+        chain_method='vectorized' #pmap leads to segfault for some reason (https://github.com/google/jax/issues/13858)
+    )
+    mcmc.run(key, obs_prev, obs_inc, surrogate_impl)
+    return mcmc.get_samples()
+
+def surrogate_posterior_fixed(surrogate, params):
+    def surrogate_impl(p, e, a):
+        return fixed_surrogate(surrogate, params, p)
+    
+    n_samples = 100
+    n_warmup = 100
+
+    kernel = NUTS(model)
+
+    mcmc = MCMC(
+        kernel,
+        num_samples=n_samples,
+        num_warmup=n_warmup,
+        num_chains=n_chains,
+        chain_method='vectorized' #pmap leads to segfault for some reason (https://github.com/google/jax/issues/13858)
+    )
+    mcmc.run(key, obs_prev, obs_inc, surrogate_impl)
+    return mcmc.get_samples()
 ```
 
 ```{code-cell} ipython3
----
-jupyter:
-  outputs_hidden: true
----
-g = sns.FacetGrid(df, row="output", col='surrogate', hue='EIR', sharey=False)
-g.map(sns.lineplot, "samples", "RE")
-g.add_legend()
+X_post_lhs_full = surrogate_posterior(surrogate_lhs_full, params_lhs_full)
+X_post_lhs_fixed = surrogate_posterior_fixed(surrogate_lhs_fixed, params_lhs_fixed)
 ```
 
 ```{code-cell} ipython3
----
-jupyter:
-  outputs_hidden: true
----
-g = sns.FacetGrid(df[df.samples == sample_points[-1]], col='output', row='surrogate', sharex=False)
-g.map(sns.boxplot, "RE")
-g.add_legend()
+y_post_lhs_full = prev_stats_batch(X_post_lhs_full)
+y_post_lhs_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, X_post_lhs_full)
+y_post_lhs_fixed = prev_stats_batch(X_post_lhs_fixed)
+y_post_lhs_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed, X_post_lhs_fixed)
 ```
 
 ```{code-cell} ipython3
-df[(df.samples == sample_points[-1]) & (df.EIR == 0)].groupby(
-    ['EIR', 'output', 'surrogate'], as_index=False
-).agg({'RE': ['mean', 'std']}).sort_values(('RE', 'mean'))
-```
-
-```{code-cell} ipython3
-def plot_surrogate_predictive_error(y_hat):
+def plot_predictive_error(y, y_hat):
     fig, axs = plt.subplots(5, len(EIRs), figsize=(10, 8))
+    y_labels = ['prev2-10', 'prev10+', 'inc0-5', 'inc5-15', 'inc15+']
+    y = jnp.concatenate(y, axis=2)
+    y_hat = jnp.concatenate(y_hat, axis=2)
     
     for i in range(5):
         axs[i, 0].set_ylabel(y_labels[i])
@@ -714,7 +475,7 @@ def plot_surrogate_predictive_error(y_hat):
             )
             axs[0, j].xaxis.set_label_position('top')
             axs[i, j].plot(
-                y[:,j, i],
+                y[:,j,i],
                 y_hat[:,j,i],
                 linestyle='',
                 marker='o',
@@ -730,26 +491,56 @@ def plot_surrogate_predictive_error(y_hat):
 ```
 
 ```{code-cell} ipython3
-plot_surrogate_predictive_error(y_hat_lhs_full[-1])
+plot_predictive_error(y_val_prior, y_val_prior_full_hat)
 ```
 
 ```{code-cell} ipython3
-plot_surrogate_predictive_error(y_hat_lhs_fixed[-1])
+plot_predictive_error(y_val_prior, y_val_prior_fixed_hat)
 ```
 
 ```{code-cell} ipython3
-plot_surrogate_predictive_error(y_hat_lhs_full_fixed_site[-1])
+plot_predictive_error(y_val_lhs, y_val_lhs_fixed_hat)
 ```
 
 ```{code-cell} ipython3
-plt.plot(full_solution(true_values, EIRs[0], etas[0])[1])
-plt.plot(full_solution_surrogate(
-    *surrogates[-1]['lhs_full'],
-    without_obs(true_values),
-    datasets['X_lhs'],
-    datasets['X_site'],
-    datasets['y_lhs_full'], EIRs[0], etas[0])[1]
-)
+plot_predictive_error(y_val_lhs, y_val_lhs_full_hat)
+```
+
+```{code-cell} ipython3
+plot_predictive_error(y_post_lhs_full, y_post_lhs_full_hat)
+```
+
+```{code-cell} ipython3
+plot_predictive_error(y_post_lhs_fixed, y_post_lhs_fixed_hat)
+```
+
+```{code-cell} ipython3
+def approximation_error(exps, labels, ys, y_hats):
+    y_labels = ['prev2-10', 'prev10+', 'inc0-5', 'inc5-15', 'inc15+']
+    ys = [jnp.concatenate(y, axis=2) for y in ys]
+    y_hats = [jnp.concatenate(y_hat, axis=2) for y_hat in y_hats]
+    return pd.concat([
+        pd.DataFrame({
+            'L1': jnp.abs(y - y_hat)[i, :, j],
+            'RE': jnp.abs(y - y_hat)[i, :, j] / y[i, :, j],
+            'EIR': float(EIRs[i]),
+            'output': y_labels[j],
+            'test_set': label,
+            'experiment': exp
+        })
+        for i in range(len(EIRs))
+        for j in range(len(y_labels))
+        for exp, label, y, y_hat in zip(exps, labels, ys, y_hats)
+    ])
+```
+
+```{code-cell} ipython3
+approximation_error(
+    ['lhs_full'] * 3 + ['lhs_fixed'] * 3,
+    ['prior', 'lhs', 'posterior'] * 2,
+    [y_val_prior, y_val_lhs, y_post_lhs_full, y_val_prior, y_val_lhs, y_post_lhs_fixed],
+    [y_val_prior_full_hat, y_val_lhs_full_hat, y_post_lhs_full_hat, y_val_prior_fixed_hat, y_val_lhs_fixed_hat, y_post_lhs_fixed_hat]
+).groupby(['experiment', 'test_set', 'output']).agg({'L1': 'mean', 'RE': 'mean'})#, 'EIR', 'output']).mean()
 ```
 
 # TODO
@@ -790,8 +581,7 @@ surrogate_impl = lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)
 
 ```{code-cell} ipython3
 def surrogate_impl(p, e, a):
-    r = fixed_solution_surrogate(*surrogates[-1]['lhs_fixed'], p, datasets['X_lhs'], datasets['y_lhs_fixed'])
-    return r[:,:2], r[:,2:]
+    return prev_stats(full_solution_surrogate(surrogate, params, p, e, a))
 ```
 
 ```{code-cell} ipython3
