@@ -14,7 +14,7 @@ kernelspec:
 
 # TODO
 
- * mox development
+ * ~mox development~
    * ~make python package~
    * ~write tests~
    * ~build documentation~
@@ -23,7 +23,6 @@ kernelspec:
    * ~use mox primitives?~
  * ~investigate du -> rU~
  * ~investigate cu/cd -> cU/cD~
- * convergence
  * ~investigate feature learning~
    * ~Refactor module setup out of Surrogate~
    * ~Create standardiser from full surrogate~
@@ -33,14 +32,24 @@ kernelspec:
    * ~Make a Surrogate class from new components~
    * ~Refactor train_surrogate to take an optimiser~
    * ~vmap the Transferred learner~
- * investigate robust training
-   * regularisation (dropout/ l2)
-   * gradient towards high loss (in progress)
  * ~investigate history matching~
  * ~try removing the limiter~
  * ~Increase sample size~
- * Consolidate prior parameter space and numpyro model
- * Train models separately for loading and evaluation
+ * ~Fix model initialisation bug~
+ * Plot other inference statistics
+ * Convergence
+   * Turn evaluation cells into a function 
+   * Save/load checkpoints
+   * execute for sample sizes up to 1e6
+ * Consolidate prior parameter space and numpyro model (https://num.pyro.ai/en/stable/_modules/numpyro/infer/inspect.html#render_model)
+ * Train models separately for loading and evaluation (fastms@feat/jax)
+   * setup package
+   * get GPU working
+   * convergence (prior/lhs/trans/active)
+   * hyperparameter tuning (lhs validation loss) (https://docs.ray.io/en/latest/tune/api/schedulers.html#asha-tune-schedulers-ashascheduler)  
+ * investigate robust training
+   * regularisation (dropout/ l2)
+   * gradient towards high loss (in progress)
 
 ```{code-cell} ipython3
 cpu_count = 100
@@ -57,15 +66,15 @@ from mox.sampling import LHSStrategy
 ```
 
 ```{code-cell} ipython3
+n_chains = 10
+```
+
+```{code-cell} ipython3
 import numpyro
 from numpyro.infer import MCMC, NUTS, Predictive
 import numpyro.distributions as dist
 import arviz as az
 import pandas as pd
-```
-
-```{code-cell} ipython3
-n_chains = 10
 ```
 
 ```{code-cell} ipython3
@@ -130,6 +139,7 @@ from mox.sampling import DistStrategy
 ```
 
 ```{code-cell} ipython3
+# TODO: take this from the model
 prior_parameter_space = [
     {
         'kb': DistStrategy(dist.LogNormal(0., .25)),
@@ -240,7 +250,7 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
     numpyro.sample(
         'obs_inc',
         dist.Independent(
-            dist.Poisson(rate=jnp.maximum(inc_stats, 1e-12), validate_args=True),
+            dist.Poisson(rate=jnp.maximum(inc_stats, 1e-12)),
             1
         ),
         obs=inc
@@ -250,10 +260,6 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
 ```{code-cell} ipython3
 key, key_i = random.split(key)
 true_values = Predictive(model, num_samples=1)(key_i)
-```
-
-```{code-cell} ipython3
-true_values
 ```
 
 ```{code-cell} ipython3
@@ -460,32 +466,6 @@ from flax.linen.module import _freeze_attr
 ```
 
 ```{code-cell} ipython3
-# TODO: This is broken
-
-from mox.active import active_training
-
-key, key_i = random.split(key)
-
-f = lambda p: prev_stats_multisite(p, EIRs, etas, full_solution)
-
-def neg_loss(x, surrogate, params):
-    return -jnp.sum(vmap(lambda x: mse(surrogate.apply(params, x), f(x[0])), in_axes=[tree_map(lambda _: 0, x)])(x))
-
-params_lhs_fixed_active = active_training(
-    X_lhs_fixed,
-    y_lhs_fixed,
-    surrogate_lhs_fixed,
-    mse,
-    key_i,
-    f,
-    neg_loss,
-    lhs_parameter_space[0:1],
-    x_min=_freeze_attr(x_min),
-    x_max=_freeze_attr(x_max)
-)
-```
-
-```{code-cell} ipython3
 # Write function for validation set generation
 def full_solution_surrogate(surrogate, surrogate_params, params, eir, eta):
     surrogate_input = _freeze_attr([params, eir, eta])
@@ -522,185 +502,25 @@ def prev_stats_batch(params):
 ```
 
 ```{code-cell} ipython3
-# Transferred model
-from flax import linen as nn
-from typing import List, Tuple
-from jaxtyping import Array, PyTree
-from mox.surrogates import summary, Recover, Limiter, InverseStandardiser, _standardise, MLP, Standardiser, Vectoriser
-from jax.tree_util import tree_leaves, tree_structure
+def surrogate_impl_full(surrogate, params):
+    return lambda p, e, a: prev_stats_multisite(p, e, a, lambda p_, e_, a_: full_solution_surrogate(surrogate, params, sort_dict(p_), e_, a_))
 
-class TransferredModel(nn.Module):
-    x_mean: PyTree
-    x_std: PyTree
-    y_shapes: List[Tuple]
-    y_boundaries: Tuple
-    y_mean: PyTree
-    y_std: PyTree
-    y_min: PyTree
-    y_max: PyTree
-    units: int
-    n_take: int
-    n_hidden: int
-    eirs: Array
-    etas: Array
-    
-    def setup(self):
-        self.rec = Recover(
-            self.y_shapes,
-            tree_structure(self.y_mean),
-            self.y_boundaries
-        )
-        self.limiter = Limiter(self.y_min, self.y_max)
-        self.inv_std = InverseStandardiser(self.y_mean, self.y_std)
-        self.full_features = MLP(self.units, self.n_take, self.units)
-        self.output_layers = MLP(self.units, self.n_hidden, self.y_boundaries[-1])
-        self.std = Standardiser(self.x_mean, self.x_std)
-        self.vec = Vectoriser()
-        
-    def __call__(self, x):
-        return self.inv_std(self.limiter(self.unstandardised(x)))
-    
-    def unstandardised(self, x):
-        # full_features = [ #TODO: vmap the feature learning
-        #     self.full_features(self.vec(self.std(x + (eir, eta))))
-        #     for eir, eta in zip(self.eirs, self.etas)
-        # ]
-        # x = jnp.concatenate(full_features)
-        full_features = vmap(
-            lambda eir, eta: self.full_features(self.vec(self.std(x + (eir, eta))))
-        )(self.eirs, self.etas)
-        x = full_features.reshape(-1)
-        y = self.output_layers(x)
-        y = self.rec(y)
-        return y
-    
-def create_transferred_model(
-        base,
-        x,
-        y,
-        y_std_axis = None,
-        y_min = None,
-        y_max = None,
-        units = 256,
-        n_take = 2,
-        n_hidden = 1
-    ) -> nn.Module:
-    y_mean, y_std = summary(y, y_std_axis)
-    y_shapes = [leaf.shape[1:] for leaf in tree_leaves(y)]
-    y_boundaries = tuple([
-        int(i) for i in
-        jnp.cumsum(jnp.array([jnp.prod(jnp.array(s)) for s in y_shapes]))
-    ])
+def surrogate_impl_fixed(surrogate, params):
+    return lambda p, e, a: fixed_surrogate(surrogate, params, sort_dict(p))
 
-    y_min_std = tree_map(
-        _standardise,
-        y_min,
-        y_mean,
-        y_std
-    )
-    y_max_std = tree_map(
-        _standardise,
-        y_max,
-        y_mean,
-        y_std
-    )
-
-    return TransferredModel(
-        base.x_mean,
-        base.x_std,
-        y_shapes,
-        y_boundaries,
-        y_mean,
-        y_std,
-        y_min_std,
-        y_max_std,
-        units,
-        n_take,
-        n_hidden,
-        EIRs,
-        etas
-    )
-```
-
-```{code-cell} ipython3
-surrogate_trans = create_transferred_model(
-    surrogate_lhs_full,
-    X_lhs_fixed,
-    y_lhs_fixed,
-    y_min=y_min_fixed,
-    y_max=y_max_fixed
-)
-```
-
-```{code-cell} ipython3
-params_trans = pytree_init(key, surrogate_trans, _freeze_attr(X_lhs_fixed))
-```
-
-```{code-cell} ipython3
-from flax.core.frozen_dict import freeze
-
-def transfer_params(base_params, new_params):
-    new_params = new_params.unfreeze()
-    for layer in range(3):
-        new_params['params']['full_features'][f'Dense_{layer}'] = base_params['params']['nn'][f'Dense_{layer}']
-    return freeze(new_params)
-```
-
-```{code-cell} ipython3
-params_trans = transfer_params(params_lhs_full, params_trans)
-```
-
-```{code-cell} ipython3
-from flax import traverse_util
-import optax
-
-partition_optimizers = {'trainable': optax.adam(5e-3), 'frozen': optax.set_to_zero()}
-param_partitions = freeze(traverse_util.path_aware_map(
-  lambda path, v: 'frozen' if ('full_features' in path) else 'trainable', params_trans))
-tx = optax.multi_transform(partition_optimizers, param_partitions)
-```
-
-```{code-cell} ipython3
-params_trans = train_surrogate(
-    X_lhs_fixed,
-    y_lhs_fixed,
-    surrogate_trans,
-    mse,
-    key_i,
-    optimiser=tx,
-    params=params_trans
-)
-```
-
-```{code-cell} ipython3
-from numpyro.infer import init_to_sample
-
-def surrogate_posterior(surrogate, params, key):
-    def surrogate_impl(p, e, a):
-        return prev_stats_multisite(p, e, a, lambda p_, e_, a_: full_solution_surrogate(surrogate, params, sort_dict(p_), e_, a_))
-    n_samples = 100
-    n_warmup = 100
-
-    kernel = NUTS(model, init_strategy=init_to_sample())
-
-    mcmc = MCMC(
-        kernel,
-        num_samples=n_samples,
-        num_warmup=n_warmup,
-        num_chains=n_chains,
-        chain_method='vectorized' #pmap leads to segfault for some reason (https://github.com/google/jax/issues/13858)
-    )
-    mcmc.run(key, obs_prev, obs_inc, surrogate_impl)
-    return mcmc.get_samples()
+def surrogate_posterior_full(surrogate, params, key):
+    return surrogate_posterior(surrogate, params, key, surrogate_impl_full(surrogate, params))
 
 def surrogate_posterior_fixed(surrogate, params, key):
-    def surrogate_impl(p, e, a):
-        return fixed_surrogate(surrogate, params, p)
-    
+    return surrogate_posterior(surrogate, params, key, surrogate_impl_fixed(surrogate, params))
+
+import numpyro
+
+def surrogate_posterior(surrogate, params, key, impl):
     n_samples = 100
     n_warmup = 100
 
-    kernel = NUTS(model, init_strategy=init_to_sample())
+    kernel = NUTS(model, forward_mode_differentiation=True) # Reverse mode has lead to initialisation errors
 
     mcmc = MCMC(
         kernel,
@@ -709,34 +529,32 @@ def surrogate_posterior_fixed(surrogate, params, key):
         num_chains=n_chains,
         chain_method='vectorized' #pmap leads to segfault for some reason (https://github.com/google/jax/issues/13858)
     )
-    mcmc.run(key, obs_prev, obs_inc, surrogate_impl)
-    return mcmc.get_samples()
+    mcmc.run(key, obs_prev, obs_inc, impl)
+    return mcmc
 ```
 
 ```{code-cell} ipython3
-X_post_lhs_full = surrogate_posterior(surrogate_lhs_full, params_lhs_full, key)
+lhs_full_mcmc = surrogate_posterior_full(surrogate_lhs_full, params_lhs_full, key)
+X_post_lhs_full = lhs_full_mcmc.get_samples()
 y_post_lhs_full = prev_stats_batch(X_post_lhs_full)
 y_post_lhs_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, X_post_lhs_full)
 
-X_post_lhs_fixed = surrogate_posterior_fixed(surrogate_lhs_fixed, params_lhs_fixed, key)
+lhs_fixed_mcmc = surrogate_posterior_fixed(surrogate_lhs_fixed, params_lhs_fixed, key)
+X_post_lhs_fixed = lhs_fixed_mcmc.get_samples()
 y_post_lhs_fixed = prev_stats_batch(X_post_lhs_fixed)
 y_post_lhs_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed, X_post_lhs_fixed)
 ```
 
 ```{code-cell} ipython3
-X_post_prior_full = surrogate_posterior(surrogate_prior_full, params_prior_full, key)
+prior_full_mcmc = surrogate_posterior_full(surrogate_prior_full, params_prior_full, key)
+X_post_prior_full = prior_full_mcmc.get_samples()
 y_post_prior_full = prev_stats_batch(X_post_prior_full)
 y_post_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, params_prior_full, X_post_prior_full)
 
-X_post_prior_fixed = surrogate_posterior_fixed(surrogate_prior_fixed, params_prior_fixed, key)
+prior_fixed_mcmc = surrogate_posterior_fixed(surrogate_prior_fixed, params_prior_fixed, key)
+X_post_prior_fixed = prior_fixed_mcmc.get_samples()
 y_post_prior_fixed = prev_stats_batch(X_post_prior_fixed)
 y_post_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fixed, params_prior_fixed, X_post_prior_fixed)
-```
-
-```{code-cell} ipython3
-X_post_lhs_trans = surrogate_posterior_fixed(surrogate_trans, params_trans, key)
-y_post_lhs_trans = prev_stats_batch(X_post_lhs_trans)
-y_post_lhs_trans_hat = prev_stats_fixed_surrogate_batch(surrogate_trans, params_trans, X_post_lhs_trans)
 ```
 
 ```{code-cell} ipython3
@@ -758,60 +576,6 @@ y_val_prior_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_f
 
 y_val_lhs_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, params_prior_full, X_val_lhs)
 y_val_lhs_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fixed, params_prior_fixed, X_val_lhs)
-```
-
-```{code-cell} ipython3
-y_val_prior_trans_hat = prev_stats_fixed_surrogate_batch(surrogate_trans, params_trans, sort_dict(without_obs(prior)))
-y_val_lhs_trans_hat = prev_stats_fixed_surrogate_batch(surrogate_trans, params_trans, X_val_lhs)
-```
-
-```{code-cell} ipython3
-def _concat(a, b):
-    return jnp.concatenate([a, b])
-
-def iterative_training(surrogate, params, f, f_posterior, x, y, key, n_iter=5):
-    for i in range(n_iter):
-        key_i, key = random.split(key)
-        x_post = f_posterior(surrogate, params, key_i)
-        y_post = f(x_post)
-        x = tree_map(_concat, x, x_post)
-        y = tree_map(_concat, y, y_post)
-        params = train_surrogate(
-            x,
-            y,
-            surrogate,
-            mse,
-            key_i,
-            optimiser=tx,
-            params=params
-        )
-    return params
-
-params_trans_iter = iterative_training(
-    surrogate_trans,
-    params_trans,
-    lambda x: prev_stats_batch(x[0]),
-    lambda m, p, k: [surrogate_posterior_fixed(m, p, k)],
-    X_lhs_fixed,
-    y_lhs_fixed,
-    key
-)
-```
-
-```{code-cell} ipython3
-X_post_trans_iter = surrogate_posterior_fixed(surrogate_trans, params_trans_iter, key)
-y_post_trans_iter = prev_stats_batch(X_post_trans_iter)
-y_post_trans_iter_hat = prev_stats_fixed_surrogate_batch(surrogate_trans, params_trans_iter, X_post_trans_iter)
-```
-
-```{code-cell} ipython3
-X_post_lhs_fixed_active = surrogate_posterior_fixed(surrogate_lhs_fixed, params_lhs_fixed_active)
-y_post_lhs_fixed_active = prev_stats_batch(X_post_lhs_fixed_active)
-y_post_lhs_fixed_active_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed_active, X_post_lhs_fixed_active)
-```
-
-```{code-cell} ipython3
-y_val_lhs_fixed_active_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed_active, X_val_lhs)
 ```
 
 ```{code-cell} ipython3
@@ -850,11 +614,11 @@ plot_predictive_error(y_val_lhs, y_val_lhs_full_hat)
 ```
 
 ```{code-cell} ipython3
-plot_predictive_error(y_post_lhs_fixed, y_post_lhs_fixed_hat)
+plot_predictive_error(y_post_prior_fixed, y_post_prior_fixed_hat)
 ```
 
 ```{code-cell} ipython3
-plot_predictive_error(y_post_lhs_full, y_post_lhs_full_hat)
+plot_predictive_error(y_post_prior_full, y_post_prior_full_hat)
 ```
 
 ```{code-cell} ipython3
@@ -878,13 +642,23 @@ def approximation_error(exps, labels, ys, y_hats):
 ```
 
 ```{code-cell} ipython3
+print(approximation_error(
+    ['lhs_full'] * 3 + ['lhs_fixed'] * 3 + ['prior_full'] * 3 + ['prior_fixed'] * 3,
+    ['prior', 'lhs', 'posterior'] * 4,
+    [y_val_prior, y_val_lhs, y_post_lhs_full, y_val_prior, y_val_lhs, y_post_lhs_fixed, y_val_prior, y_val_lhs, y_post_prior_full, y_val_prior, y_val_lhs, y_post_prior_fixed],
+    [y_val_prior_full_hat, y_val_lhs_full_hat, y_post_lhs_full_hat, y_val_prior_fixed_hat, y_val_lhs_fixed_hat, y_post_lhs_fixed_hat,
+     y_val_prior_prior_full_hat, y_val_lhs_prior_full_hat, y_post_prior_full_hat, y_val_prior_prior_fixed_hat, y_val_lhs_prior_fixed_hat, y_post_prior_fixed_hat]
+).groupby(['experiment', 'test_set'], as_index=False).agg({'RE': 'mean'}).pivot(index='experiment', columns='test_set', values='RE').to_latex(float_format="{:0.2f}".format))#, 'EIR', 'output']).mean()
+```
+
+```{code-cell} ipython3
 approximation_error(
     ['lhs_full'] * 3 + ['lhs_fixed'] * 3 + ['prior_full'] * 3 + ['prior_fixed'] * 3,
     ['prior', 'lhs', 'posterior'] * 4,
     [y_val_prior, y_val_lhs, y_post_lhs_full, y_val_prior, y_val_lhs, y_post_lhs_fixed, y_val_prior, y_val_lhs, y_post_prior_full, y_val_prior, y_val_lhs, y_post_prior_fixed],
     [y_val_prior_full_hat, y_val_lhs_full_hat, y_post_lhs_full_hat, y_val_prior_fixed_hat, y_val_lhs_fixed_hat, y_post_lhs_fixed_hat,
      y_val_prior_prior_full_hat, y_val_lhs_prior_full_hat, y_post_prior_full_hat, y_val_prior_prior_fixed_hat, y_val_lhs_prior_fixed_hat, y_post_prior_fixed_hat]
-).groupby(['experiment', 'test_set']).agg({'RE': 'mean'})#, 'EIR', 'output']).mean()
+)
 ```
 
 ```{code-cell} ipython3
@@ -903,39 +677,6 @@ mcmc.print_summary(prob=0.7)
 ```
 
 ```{code-cell} ipython3
-def surrogate_impl(p, e, a):
-    return fixed_surrogate(surrogate_prior_fixed, params_prior_fixed, sort_dict(p))
-```
-
-```{code-cell} ipython3
-# n_samples = 1000
-# n_warmup = 1000
-
-# from numpyro.contrib.tfp.mcmc import RandomWalkMetropolis
-# import tensorflow_probability as tfp
-
-# kernel = RandomWalkMetropolis(
-#     model,
-#     new_state_fn=tfp.substrates.jax.mcmc.random_walk_normal_fn(scale=.04)
-# )
-
-n_samples = 100
-n_warmup = 100
-
-kernel = NUTS(model)
-
-mcmc_surrogate = MCMC(
-    kernel,
-    num_samples=n_samples,
-    num_warmup=n_warmup,
-    num_chains=n_chains,
-    chain_method='vectorized' #pmap leads to segfault for some reason (https://github.com/google/jax/issues/13858)
-)
-mcmc_surrogate.run(key, obs_prev, obs_inc, surrogate_impl)
-mcmc_surrogate.print_summary(prob=0.7)
-```
-
-```{code-cell} ipython3
 posterior_samples = mcmc.get_samples()
 posterior_predictive = Predictive(
     model,
@@ -944,32 +685,58 @@ posterior_predictive = Predictive(
 ```
 
 ```{code-cell} ipython3
-posterior_samples_surrogate = mcmc_surrogate.get_samples()
-posterior_predictive_surrogate = Predictive(
+prior_fixed_samples = prior_fixed_mcmc.get_samples()
+prior_fixed_predictive = Predictive(
     model,
-    posterior_samples_surrogate
+    prior_fixed_samples
 )(key, obs_prev, obs_inc)
+```
+
+```{code-cell} ipython3
+lhs_fixed_samples = lhs_fixed_mcmc.get_samples()
+lhs_fixed_predictive = Predictive(
+    model,
+    lhs_fixed_samples
+)(key, obs_prev, obs_inc)
+```
+
+```{code-cell} ipython3
+posterior_predictive['obs_inc'][]
+```
+
+```{code-cell} ipython3
+tree_map(lambda a, b: ks_2samp(a[:, 1, 4, 1], b[:, 1, 4, 1]), posterior_predictive, prior_fixed_predictive)
 ```
 
 ```{code-cell} ipython3
 from scipy.stats import ks_2samp
 sample_keys = list(posterior_samples.keys())
-ks_tests = pd.DataFrame([
-    {'statistic': ks_2samp(posterior_samples[k], posterior_samples_surrogate[k]).statistic, 'p-value': ks_2samp(posterior_samples[k], posterior_samples_surrogate[k]).pvalue}
+ks_data = pd.DataFrame([
+    {'experiment': name, 'variable': k, 'statistic': ks_2samp(posterior_samples[k], posterior[k]).statistic, 'p-value': ks_2samp(posterior_samples[k], posterior[k]).pvalue}
     for k in sample_keys
-], sample_keys)
+    for name, posterior in [
+        ('prior_fixed', prior_fixed_mcmc.get_samples()),
+        ('prior_full', prior_full_mcmc.get_samples()),
+        ('lhs_fixed', lhs_fixed_mcmc.get_samples()),
+        ('lhs_full', lhs_full_mcmc.get_samples())
+    ]
+])
 ```
 
 ```{code-cell} ipython3
-from numpyro.diagnostics import summary
-#d = pd.DataFrame(summary(mcmc.get_samples(group_by_chain=True), prob=0.7)).transpose()
-d = pd.concat([
-    pd.DataFrame(summary(mcmc.get_samples(group_by_chain=True), prob=0.7)).transpose()[['mean', 'std', 'n_eff', 'r_hat']],
-    pd.DataFrame(summary(mcmc_surrogate.get_samples(group_by_chain=True), prob=0.7)).transpose()[['mean', 'std', 'n_eff', 'r_hat']],
-    ks_tests
-], axis=1, keys=['equilibrium solution', 'surrogate', 'KS'])
-d['true_value'] = pd.Series(without_obs(true_values)).apply(lambda x: x[0]).astype(float)
-print(d.to_latex(float_format="{:0.2f}".format))
+from flax.training import orbax_utils
+import orbax.checkpoint
+
+def save_model(name, surrogate, params):
+    ckpt = {
+        'surrogate': surrogate,
+        'params': params
+    }
+    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+    save_args = orbax_utils.save_args_from_target(ckpt)
+    orbax_checkpointer.save(f'orbax/{name}', ckpt, force=True, save_args=save_args)
+    
+save_model(f'prior_fixed_{train_samples}', surrogate_prior_fixed, params_prior_fixed)
 ```
 
 ```{code-cell} ipython3
@@ -1037,6 +804,10 @@ true_curves = get_curves(without_obs(true_values), EIRs, etas)
 ```
 
 ```{code-cell} ipython3
+true_curves['prob_b'].shape
+```
+
+```{code-cell} ipython3
 fig, axs = plt.subplots(3, len(EIRs), sharey=True, sharex=True)
 imm_labels = ['b', 'c', 'd']
 for i in range(len(EIRs)):
@@ -1044,10 +815,10 @@ for i in range(len(EIRs)):
         f'EIR: {EIRs[i]}'
     )
     axs[0, i].xaxis.set_label_position('top')
-    for imm in range(3):
-        axs[imm, i].plot(posterior_curves[i, :, 2+imm, :].T, color='r', alpha=.01)
-        axs[imm, i].plot(true_curves[i, 0, 2+imm, :])
-        axs[imm, 0].set_ylabel(f'prob. {imm_labels[imm]}')
+    for imm_i, imm in enumerate([f'prob_{l}' for l in imm_labels]):
+        axs[imm_i, i].plot(posterior_curves[imm][i, :, :].T, color='r', alpha=.01)
+        axs[imm_i, i].plot(true_curves[imm][i, 0, :].T)
+        axs[imm_i, 0].set_ylabel(f'prob. {imm_labels[imm_i]}')
         
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
@@ -1059,14 +830,14 @@ fig, axs = plt.subplots(2, len(EIRs), sharey='row', sharex=True)
 
 prev_labels = ['pos_M', 'inc']
 for i in range(len(EIRs)):
-    for prev in range(2):
+    for prev_i, prev in enumerate(prev_labels):
         axs[0, i].set_xlabel(
             f'EIR: {EIRs[i]}'
         )
         axs[0, i].xaxis.set_label_position('top')
-        axs[prev, i].plot(posterior_curves[i, :, prev, :].T, color='r', alpha=.01)
-        axs[prev, i].plot(true_curves[i, 0, prev, :])
-        axs[prev, 0].set_ylabel(prev_labels[prev])
+        axs[prev_i, i].plot(posterior_curves[prev][i, :, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(true_curves[prev][i, 0, :])
+        axs[prev_i, 0].set_ylabel(prev)
         #axs[prev, 0].set_yscale('log')
         
 fig.tight_layout()
@@ -1082,10 +853,10 @@ for i in range(len(EIRs)):
         f'EIR: {EIRs[i]}'
     )
     axs[0, i].xaxis.set_label_position('top')
-    for imm in range(3):
-        axs[imm, i].plot(posterior_curves_surrogate[i, :, 2+imm, :].T, color='r', alpha=.01)
-        axs[imm, i].plot(true_curves[i, 0, 2+imm, :])
-        axs[imm, 0].set_ylabel(f'prob. {imm_labels[imm]}')
+    for imm_i, imm in enumerate([f'prob_{l}' for l in imm_labels]):
+        axs[imm_i, i].plot(posterior_curves_surrogate[imm][i, :, :].T, color='r', alpha=.01)
+        axs[imm_i, i].plot(true_curves[imm][i, 0, :].T)
+        axs[imm_i, 0].set_ylabel(f'prob. {imm_labels[imm_i]}')
         
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
@@ -1097,12 +868,12 @@ fig, axs = plt.subplots(2, len(EIRs), sharey='row', sharex=True)
 
 prev_labels = ['pos_M', 'inc']
 for i in range(len(EIRs)):
-    for prev in range(2):
+    for prev_i, prev in enumerate(prev_labels):
         axs[0, i].set_xlabel(f'EIR: {EIRs[i]}')
         axs[0, i].xaxis.set_label_position('top')
-        axs[prev, i].plot(posterior_curves_surrogate[i, :, prev, :].T, color='r', alpha=.01)
-        axs[prev, i].plot(true_curves[i, 0, prev, :])
-        axs[prev, 0].set_ylabel(prev_labels[prev])
+        axs[prev_i, i].plot(posterior_curves_surrogate[prev][i, :, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(true_curves[prev][i, 0, :])
+        axs[prev_i, 0].set_ylabel(prev)
         
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
