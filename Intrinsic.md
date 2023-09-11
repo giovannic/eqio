@@ -31,6 +31,7 @@ from numpyro.infer import MCMC, NUTS, Predictive
 import numpyro.distributions as dist
 import arviz as az
 import pandas as pd
+import dmeq
 ```
 
 ```{code-cell} ipython3
@@ -48,10 +49,10 @@ def full_solution(params, eir, eta):
     return {
         'pos_M': s[0],
         'inc': s[1],
-        'prob_b': s[3],
-        'prob_c': s[4],
-        'prob_d': s[5],
-        'prop': s[2],
+        'prob_b': s[2],
+        'prob_c': s[3],
+        'prob_d': s[4],
+        'prop': s[5],
     }
 ```
 
@@ -91,91 +92,16 @@ etas = 1. / random.uniform(key_i, shape=EIRs.shape, minval=20*365, maxval=40*365
 ```
 
 ```{code-cell} ipython3
-def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
-    # Pre-erythrocytic immunity
-    kb = numpyro.sample('kb', dist.LogNormal(0., .25))
-    ub = numpyro.sample('ub', dist.LogNormal(0., .25))
-    b0 = numpyro.sample('b0', dist.Beta(1., 1.))
-    IB0 = numpyro.sample('IB0', dist.LeftTruncatedDistribution(dist.Normal(50., 10.), low=0.))
-    
-    # Clinical immunity
-    kc = numpyro.sample('kc', dist.LogNormal(0., .25))
-    uc = numpyro.sample('uc', dist.LogNormal(0., .25))
-    phi0 = numpyro.sample('phi0', dist.Beta(5., 1.))
-    phi1 = numpyro.sample('phi1', dist.Beta(1., 2.))
-    IC0 = numpyro.sample('IC0',dist.LeftTruncatedDistribution(dist.Cauchy(100., 10.), low=0.))
-    PM = numpyro.sample('PM', dist.Beta(1., 1.))
-    dm = numpyro.sample('dm', dist.LeftTruncatedDistribution(dist.Cauchy(200., 10.), low=0.))
-    
-    # Detection immunity
-    kd = numpyro.sample('kd', dist.LogNormal(0., .25))
-    ud = numpyro.sample('ud', dist.LogNormal(0., .25))
-    d1 = numpyro.sample('d1', dist.Beta(1., 2.))
-    ID0 = numpyro.sample('ID0', dist.LeftTruncatedDistribution(dist.Cauchy(25., 1.), low=0.))
-    fd0 = numpyro.sample('fd0', dist.Beta(1., 1.))
-    gd = numpyro.sample('gd', dist.LogNormal(0., .25))
-    ad0 = numpyro.sample('ad0', dist.TruncatedDistribution(
-            dist.Cauchy(30. * 365., 365.),
-            low=20. * 365.,
-            high=40. * 365.
-        ))
-    
-    ru = numpyro.sample('rU', dist.LogNormal(0., .25))
-    
-    x = {
-        'kb': kb,
-        'ub': ub,
-        'b0': b0,
-        'IB0': IB0,
-        'kc': kc,
-        'uc': uc,
-        'IC0': IC0,
-        'phi0': phi0,
-        'phi1': phi1,
-        'PM': PM,
-        'dm': dm,
-        'kd': kd,
-        'ud': ud,
-        'd1': d1,
-        'ID0': ID0,
-        'fd0': fd0,
-        'gd': gd,
-        'ad0': ad0,
-        'rU': ru
-    }
-    
-    prev_stats, inc_stats = impl(x, EIRs, etas)
-    
-    numpyro.sample(
-        'obs_prev',
-        dist.Independent(
-            dist.Binomial(total_count=prev_N, probs=prev_stats.reshape(-1), validate_args=True),
-            1
-        ),
-        obs=prev
-    )
-
-    numpyro.sample(
-        'obs_inc',
-        dist.Independent(
-            dist.Poisson(rate=jnp.maximum(inc_stats.reshape(-1), 1e-12)),
-            1
-        ),
-        obs=inc
-    )
-```
-
-```{code-cell} ipython3
 def weak_model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
     # Pre-erythrocytic immunity
-    kb = numpyro.sample('kb', dist.LogNormal(0., 1.))
-    ub = numpyro.sample('ub', dist.LogNormal(0., 1.))
+    kb = numpyro.sample('kb', dist.Uniform(0., 10.))
+    ub = numpyro.sample('ub', dist.Uniform(0., 10.))
     b0 = numpyro.sample('b0', dist.Beta(1., 1.))
     IB0 = numpyro.sample('IB0', dist.Uniform(0., 1000.))
     
     # Clinical immunity
-    kc = numpyro.sample('kc', dist.LogNormal(0., 1.))
-    uc = numpyro.sample('uc', dist.LogNormal(0., 1.))
+    kc = numpyro.sample('kc', dist.Uniform(0., 10.))
+    uc = numpyro.sample('uc', dist.Uniform(0., 10.))
     phi0 = numpyro.sample('phi0', dist.Beta(1., 1.))
     phi1 = numpyro.sample('phi1', dist.Beta(1., 1.))
     IC0 = numpyro.sample('IC0', dist.Uniform(0., 1000.))
@@ -183,15 +109,15 @@ def weak_model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p,
     dm = numpyro.sample('dm', dist.Uniform(0., 1000.))
     
     # Detection immunity
-    kd = numpyro.sample('kd', dist.LogNormal(0., 1.))
-    ud = numpyro.sample('ud', dist.LogNormal(0., 1.))
+    kd = numpyro.sample('kd', dist.Uniform(0., 10.))
+    ud = numpyro.sample('ud', dist.Uniform(0., 10.))
     d1 = numpyro.sample('d1', dist.Beta(1., 1.))
     ID0 = numpyro.sample('ID0', dist.Uniform(0., 1000.))
     fd0 = numpyro.sample('fd0', dist.Beta(1., 1.))
-    gd = numpyro.sample('gd', dist.LogNormal(0., 1.))
-    ad0 = numpyro.sample('ad0', dist.Uniform(20.*365., 40.*365))
+    gd = numpyro.sample('gd', dist.Uniform(0., 10.))
+    ad0 = numpyro.sample('ad0', dist.Uniform(0., 100.*365.))
     
-    ru = numpyro.sample('rU', dist.LogNormal(0., 1.))
+    ru = numpyro.sample('rU', dist.Uniform(0., 10.))
 
     x = {
         'kb': kb,
@@ -237,6 +163,82 @@ def weak_model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p,
 ```
 
 ```{code-cell} ipython3
+def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
+    # Pre-erythrocytic immunity
+    kb = numpyro.sample('kb', dist.LogNormal(0., 1.))
+    ub = numpyro.sample('ub', dist.LogNormal(0., 1.))
+    b0 = numpyro.sample('b0', dist.Beta(1., 1.))
+    IB0 = numpyro.sample('IB0', dist.LeftTruncatedDistribution(dist.Normal(50., 10.), low=0.))
+    
+    # Clinical immunity
+    kc = numpyro.sample('kc', dist.LogNormal(0., 1.))
+    uc = numpyro.sample('uc', dist.LogNormal(0., 1.))
+    phi0 = numpyro.sample('phi0', dist.Beta(5., 1.))
+    phi1 = numpyro.sample('phi1', dist.Beta(1., 2.))
+    IC0 = numpyro.sample('IC0',dist.LeftTruncatedDistribution(dist.Cauchy(100., 10.), low=0.))
+    PM = numpyro.sample('PM', dist.Beta(1., 1.))
+    dm = numpyro.sample('dm', dist.LeftTruncatedDistribution(dist.Cauchy(200., 10.), low=0.))
+    
+    # Detection immunity
+    kd = numpyro.sample('kd', dist.LogNormal(0., 1.))
+    ud = numpyro.sample('ud', dist.LogNormal(0., 1.))
+    d1 = numpyro.sample('d1', dist.Beta(1., 2.))
+    ID0 = numpyro.sample('ID0', dist.LeftTruncatedDistribution(dist.Cauchy(25., 1.), low=0.))
+    fd0 = numpyro.sample('fd0', dist.Beta(1., 1.))
+    gd = numpyro.sample('gd', dist.LogNormal(0., 1.))
+    ad0 = numpyro.sample('ad0', dist.TruncatedDistribution(
+            dist.Cauchy(30. * 365., 365.),
+            low=20. * 365.,
+            high=40. * 365.
+        )
+    )
+    
+    ru = numpyro.sample('rU', dist.LogNormal(0., 1.))
+    
+    x = {
+        'kb': kb,
+        'ub': ub,
+        'b0': b0,
+        'IB0': IB0,
+        'kc': kc,
+        'uc': uc,
+        'IC0': IC0,
+        'phi0': phi0,
+        'phi1': phi1,
+        'PM': PM,
+        'dm': dm,
+        'kd': kd,
+        'ud': ud,
+        'd1': d1,
+        'ID0': ID0,
+        'fd0': fd0,
+        'gd': gd,
+        'ad0': ad0,
+        'rU': ru
+    }
+    
+    prev_stats, inc_stats = impl(x, EIRs, etas)
+    
+    numpyro.sample(
+        'obs_prev',
+        dist.Independent(
+            dist.Binomial(total_count=prev_N, probs=prev_stats.reshape(-1), validate_args=True),
+            1
+        ),
+        obs=prev
+    )
+
+    numpyro.sample(
+        'obs_inc',
+        dist.Independent(
+            dist.Poisson(rate=jnp.maximum(inc_stats.reshape(-1), 1e-12)),
+            1
+        ),
+        obs=inc
+    )
+```
+
+```{code-cell} ipython3
 key, key_i = random.split(key)
 true_values = Predictive(model, num_samples=1)(key_i)
 ```
@@ -259,12 +261,12 @@ def without_obs(params):
 
 ```{code-cell} ipython3
 key, key_i = random.split(key)
-prior = Predictive(model, num_samples=600)(key_i)
+prior = Predictive(model, num_samples=1000)(key_i)
 ```
 
 ```{code-cell} ipython3
 key, key_i = random.split(key)
-weak_prior = Predictive(weak_model, num_samples=600)(key_i)
+weak_prior = Predictive(weak_model, num_samples=1000)(key_i)
 ```
 
 ```{code-cell} ipython3
@@ -284,8 +286,14 @@ def densities(p, model):
         ld[1]['obs_prev']['fn'].base_dist.log_prob(ld[1]['obs_prev']['value']).reshape((len(EIRs), 2)),
         ld[1]['obs_inc']['fn'].base_dist.log_prob(ld[1]['obs_inc']['value']).reshape((len(EIRs), 3))
     )
+```
 
-sensitivity = vmap(jacfwd(densities), in_axes=[tree_map(lambda _: 0, without_obs(weak_prior)), None])(without_obs(weak_prior), weak_model)
+```{code-cell} ipython3
+sensitivity = vmap(jacfwd(densities), in_axes=[tree_map(lambda _: 0, without_obs(prior)), None])(without_obs(prior), model)
+```
+
+```{code-cell} ipython3
+weak_sensitivity = vmap(jacfwd(densities), in_axes=[tree_map(lambda _: 0, without_obs(weak_prior)), None])(without_obs(weak_prior), weak_model)
 ```
 
 ```{code-cell} ipython3
@@ -317,7 +325,33 @@ sensitivity_age_group_df = pd.concat([
 ```
 
 ```{code-cell} ipython3
+weak_sensitivity_df = pd.concat([
+    pd.DataFrame({
+        'parameter': parameter,
+        'gradient': weak_sensitivity[0][parameter]
+    })
+    for parameter in weak_sensitivity[0].keys()
+])
+```
+
+```{code-cell} ipython3
 import seaborn as sns
+```
+
+```{code-cell} ipython3
+fig, ax = plt.subplots(figsize=(19.7, 8.27))
+sns.barplot(
+    weak_sensitivity_df,
+    x='parameter',
+    y='gradient',
+    estimator=lambda x: jnp.mean(jnp.abs(jnp.array(x))),
+    errorbar=('ci', 95),
+    ax=ax
+)
+ax.set_xlabel('Intrinsic Parameter')
+ax.set_ylabel('Absolute Mean gradient')
+ax.set_title('Sensitivity of Weak Priors')
+ax.set_yscale('log')
 ```
 
 ```{code-cell} ipython3
@@ -326,39 +360,54 @@ sns.barplot(
     sensitivity_df,
     x='parameter',
     y='gradient',
-    estimator='mean',
+    estimator=lambda x: jnp.mean(jnp.abs(jnp.array(x))),
     errorbar=('ci', 95),
     ax=ax
 )
 ax.set_xlabel('Intrinsic Parameter')
-ax.set_ylabel('Sensitivity (mean gradient)')
+ax.set_ylabel('Absolute Mean Gradient')
+ax.set_title('Sensitivity of Tuned Priors')
+ax.set_yscale('log')
 ```
 
 ```{code-cell} ipython3
 norm = plt.Normalize(sensitivity_age_group_df.EIR.min(), sensitivity_age_group_df.EIR.max())
 sm = plt.cm.ScalarMappable(cmap="Reds", norm=norm)
 fig, ax = plt.subplots(figsize=(19.7, 8.27))
-sns.barplot(sensitivity_age_group_df, x='parameter', y='gradient', hue='EIR', estimator='mean', errorbar=('ci', 95), palette='Reds', ax=ax)
+sns.barplot(
+    sensitivity_age_group_df,
+    x='parameter',
+    y='gradient',
+    hue='EIR',
+    estimator=lambda x: jnp.mean(jnp.abs(jnp.array(x))),
+    errorbar=('ci', 95),
+    palette='Reds',
+    ax=ax
+)
 ax.get_legend().remove()
 cbar = ax.figure.colorbar(sm, ax=ax)
 cbar.ax.set_ylabel('EIR')
 ax.set_xlabel('Intrinsic Parameter')
-ax.set_ylabel('Sensitivity (mean gradient)')
+ax.set_ylabel('Absolute Mean Gradient')
+ax.set_yscale('log')
+ax.set_title('Sensitivity of Tuned Priors Disaggregated by EIR')
 ```
 
 ```{code-cell} ipython3
 fig, ax = plt.subplots(figsize=(19.7, 8.27))
 sns.barplot(
-    sensitivity_age_group_df[sensitivity_age_group_df.parameter.isin(['IB0', 'IC0', 'b0', 'kb', 'kc', 'phi0', 'phi1', 'ub', 'uc'])],
+    sensitivity_age_group_df,
     x='parameter',
     y='gradient',
     hue='age_group',
-    estimator='mean',
+    estimator=lambda x: jnp.mean(jnp.abs(jnp.array(x))),
     errorbar=('ci', 95),
     ax=ax
 )
 ax.set_xlabel('Intrinsic Parameter')
-ax.set_ylabel('Sensitivity (mean gradient)')
+ax.set_ylabel('Absolute Mean Gradient')
+ax.set_yscale('log')
+ax.set_title('Sensitivity of Tuned Priors Disaggregated by Model Output')
 ```
 
 ```{code-cell} ipython3
@@ -381,6 +430,7 @@ true_curves = get_curves(without_obs(true_values), EIRs, etas)
 ```
 
 ```{code-cell} ipython3
+n_curves = 500
 fig, axs = plt.subplots(3, len(EIRs), sharey='row', sharex=True)
 imm_labels = ['prob_b', 'prob_c', 'prob_d']
 for i in range(len(EIRs)):
@@ -389,7 +439,7 @@ for i in range(len(EIRs)):
     )
     axs[0, i].xaxis.set_label_position('top')
     for imm_i, imm in enumerate(imm_labels):
-        axs[imm_i, i].plot(prior_curves[imm][i, :, :].T, color='r', alpha=.01)
+        axs[imm_i, i].plot(prior_curves[imm][i, :n_curves, :].T, color='r', alpha=.01)
         axs[imm_i, i].plot(true_curves[imm][i, 0, :])
         axs[imm_i, 0].set_ylabel(imm)
         
@@ -407,17 +457,13 @@ for i in range(len(EIRs)):
     )
     axs[0, i].xaxis.set_label_position('top')
     for imm_i, imm in enumerate(imm_labels):
-        axs[imm_i, i].plot(weak_prior_curves[imm][i, :, :].T, color='r', alpha=.01)
+        axs[imm_i, i].plot(weak_prior_curves[imm][i, :n_curves, :].T, color='r', alpha=.01)
         axs[imm_i, i].plot(true_curves[imm][i, 0, :])
         axs[imm_i, 0].set_ylabel(imm)
         
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
 fig.text(0.5, 1, 'Weak Prior immunity probability function', ha='center')
-```
-
-```{code-cell} ipython3
-
 ```
 
 ```{code-cell} ipython3
@@ -430,7 +476,7 @@ for i in range(len(EIRs)):
             f'EIR: {EIRs[i]}'
         )
         axs[0, i].xaxis.set_label_position('top')
-        axs[prev_i, i].plot(prior_curves[prev][i, :, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(prior_curves[prev][i, :n_curves, :].T, color='r', alpha=.01)
         axs[prev_i, i].plot(true_curves[prev][i, 0, :])
         axs[prev_i, 0].set_ylabel(prev)
         #axs[prev_i, 0].set_yscale('log')
@@ -450,7 +496,7 @@ for i in range(len(EIRs)):
             f'EIR: {EIRs[i]}'
         )
         axs[0, i].xaxis.set_label_position('top')
-        axs[prev_i, i].plot(weak_prior_curves[prev][i, :, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(weak_prior_curves[prev][i, :n_curves, :].T, color='r', alpha=.01)
         axs[prev_i, i].plot(true_curves[prev][i, 0, :])
         axs[prev_i, 0].set_ylabel(prev)
         #axs[prev_i, 0].set_yscale('log')
@@ -627,6 +673,22 @@ for i in range(len(EIRs)):
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
 fig.text(0.5, 1, 'Weak Posterior pos_M/inc function', ha='center')
+```
+
+```{code-cell} ipython3
+posterior_df = pd.concat([
+    pd.DataFrame(posterior_samples).assign(priors='tuned'),
+    pd.DataFrame(weak_posterior_samples).assign(priors='weak')
+])
+sns.pairplot(posterior_df[['b0', 'ub', 'IB0', 'kb', 'priors']], hue='priors', kind='kde')
+```
+
+```{code-cell} ipython3
+sns.pairplot(posterior_df[['phi0', 'phi1', 'kc', 'uc', 'IC0', 'PM', 'dm', 'priors']], hue='priors', kind='kde')
+```
+
+```{code-cell} ipython3
+sns.pairplot(posterior_df[['d1', 'kd', 'ud', 'ID0', 'fd0', 'gd', 'rU', 'priors']], hue='priors', kind='kde')
 ```
 
 ```{code-cell} ipython3
