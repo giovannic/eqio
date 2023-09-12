@@ -40,6 +40,7 @@ key = random.PRNGKey(42)
 
 ```{code-cell} ipython3
 def full_solution(params, eir, eta):
+    max_age = 99
     p = dmeq.default_parameters()
     for k, v in params.items():
         p[k] = v
@@ -47,12 +48,12 @@ def full_solution(params, eir, eta):
     p['eta'] = eta
     s = dmeq.solve(p, dtype=jnp.float64)
     return {
-        'pos_M': s[0],
-        'inc': s[1],
-        'prob_b': s[2],
-        'prob_c': s[3],
-        'prob_d': s[4],
-        'prop': s[5],
+        'pos_M': s[0][:max_age],
+        'inc': s[1][:max_age],
+        'prob_b': s[2][:max_age],
+        'prob_c': s[3][:max_age],
+        'prob_d': s[4][:max_age],
+        'prop': s[5][:max_age],
     }
 ```
 
@@ -341,32 +342,17 @@ import seaborn as sns
 ```{code-cell} ipython3
 fig, ax = plt.subplots(figsize=(19.7, 8.27))
 sns.barplot(
-    weak_sensitivity_df,
+    pd.concat([sensitivity_df.assign(priors='tuned'), weak_sensitivity_df.assign(priors='weak')]),
     x='parameter',
     y='gradient',
+    hue='priors',
     estimator=lambda x: jnp.mean(jnp.abs(jnp.array(x))),
     errorbar=('ci', 95),
     ax=ax
 )
 ax.set_xlabel('Intrinsic Parameter')
 ax.set_ylabel('Absolute Mean gradient')
-ax.set_title('Sensitivity of Weak Priors')
-ax.set_yscale('log')
-```
-
-```{code-cell} ipython3
-fig, ax = plt.subplots(figsize=(19.7, 8.27))
-sns.barplot(
-    sensitivity_df,
-    x='parameter',
-    y='gradient',
-    estimator=lambda x: jnp.mean(jnp.abs(jnp.array(x))),
-    errorbar=('ci', 95),
-    ax=ax
-)
-ax.set_xlabel('Intrinsic Parameter')
-ax.set_ylabel('Absolute Mean Gradient')
-ax.set_title('Sensitivity of Tuned Priors')
+ax.set_title('Sensitivity of Priors')
 ax.set_yscale('log')
 ```
 
@@ -680,15 +666,62 @@ posterior_df = pd.concat([
     pd.DataFrame(posterior_samples).assign(priors='tuned'),
     pd.DataFrame(weak_posterior_samples).assign(priors='weak')
 ])
-sns.pairplot(posterior_df[['b0', 'ub', 'IB0', 'kb', 'priors']], hue='priors', kind='kde')
 ```
 
 ```{code-cell} ipython3
-sns.pairplot(posterior_df[['phi0', 'phi1', 'kc', 'uc', 'IC0', 'PM', 'dm', 'priors']], hue='priors', kind='kde')
+p = sns.pairplot(posterior_df[['b0', 'ub', 'IB0', 'kb', 'priors']], hue='priors', kind='kde')
+p.fig.suptitle('Correlation in the posterior estimates of pre-erythrocytic immunity parameters', y=1.03)
 ```
 
 ```{code-cell} ipython3
-sns.pairplot(posterior_df[['d1', 'kd', 'ud', 'ID0', 'fd0', 'gd', 'rU', 'priors']], hue='priors', kind='kde')
+p = sns.pairplot(posterior_df[['phi0', 'phi1', 'kc', 'uc', 'IC0', 'PM', 'dm', 'priors']], hue='priors', kind='kde')
+p.fig.suptitle('Correlation in the posterior estimates of clinical immunity parameters', y=1.03)
+```
+
+```{code-cell} ipython3
+p = sns.pairplot(posterior_df[['d1', 'kd', 'ud', 'ID0', 'fd0', 'gd', 'rU', 'priors']], hue='priors', kind='kde')
+p.fig.suptitle('Correlation in the posterior estimates of immunity to detection parameters', y=1.08)
+```
+
+```{code-cell} ipython3
+from numpyro.diagnostics import summary
+print(pd.concat([
+    pd.DataFrame.from_dict(summary(weak_mcmc.get_samples(group_by_chain=True)), orient='index'),
+    pd.DataFrame.from_dict(summary(mcmc.get_samples(group_by_chain=True)), orient='index'),
+    pd.DataFrame.from_dict(without_obs(true_values), orient='index', columns=['value']),
+], axis=1, keys=['weak', 'tuned', 'latent']).loc[[
+        # Pre-erythrocytic immunity
+    'kb',
+    'ub',
+    'b0',
+    'IB0',
+    
+    # Clinical immunity
+    'kc',
+    'uc',
+    'phi0',
+    'phi1',
+    'IC0',
+    'PM',
+    'dm',
+    
+    # Detection immunity
+    'kd',
+    'ud',
+    'd1',
+    'ID0',
+    'fd0',
+    'gd',
+    'ad0',
+    'rU',
+]].to_latex(formatters=[lambda x: '%.3f' % x] * 15))
+```
+
+```{code-cell} ipython3
+(
+    jnp.sum(obs_inc - weak_posterior_predictive['obs_inc'] > 0),
+    jnp.sum(obs_prev - weak_posterior_predictive['obs_prev'] > 0)
+)
 ```
 
 ```{code-cell} ipython3
