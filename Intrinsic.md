@@ -169,7 +169,7 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
     kb = numpyro.sample('kb', dist.LogNormal(0., 1.))
     ub = numpyro.sample('ub', dist.LogNormal(0., 1.))
     b0 = numpyro.sample('b0', dist.Beta(1., 1.))
-    IB0 = numpyro.sample('IB0', dist.LeftTruncatedDistribution(dist.Normal(50., 10.), low=0.))
+    IB0 = numpyro.sample('IB0', dist.LeftTruncatedDistribution(dist.Cauchy(50., 10.), low=0.))
     
     # Clinical immunity
     kc = numpyro.sample('kc', dist.LogNormal(0., 1.))
