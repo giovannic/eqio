@@ -274,7 +274,22 @@ intrinsic_bounds = pd.DataFrame.from_records([
     ('rU', 0, 1),
 ], columns=['name', 'lower', 'upper'])
 
-lhs_parameter_space = [
+lhs_train_space = [
+    {
+        name: LHSStrategy(lower, upper)
+        for name, lower, upper in intrinsic_bounds.itertuples(index=False)
+    },
+    DistStrategy(dist.MixtureGeneral(
+        dist.Categorical(probs=jnp.array([.25, .75])),
+        [
+            dist.TruncatedDistribution(dist.Normal(0., .05), low=0., high=500.),
+            dist.Uniform(0., 500.)
+        ]
+    )),
+    LHSStrategy(1/(40 * 365), 1/(20 * 365))
+]
+
+lhs_test_space = [
     {
         name: LHSStrategy(lower, upper)
         for name, lower, upper in intrinsic_bounds.itertuples(index=False)
@@ -286,12 +301,12 @@ lhs_parameter_space = [
 x_min = [{
     name: lower
     for name, lower, _ in intrinsic_bounds.itertuples(index=False)
-}]
+}, 0., 1/(40 * 365)]
 
 x_max = [{
     name: upper
     for name, _, upper in intrinsic_bounds.itertuples(index=False)
-}]
+}, 500., 1/(20 * 365)]
 ```
 
 ```{code-cell} ipython3
@@ -307,7 +322,7 @@ from mox.loss import mse
 
 ```{code-cell} ipython3
 key_i, key = random.split(key)
-X_lhs_full = sample(lhs_parameter_space, train_samples, key_i)
+X_lhs_full = sample(lhs_train_space, train_samples, key_i)
 y_lhs_full = vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0])(*X_lhs_full)
 max_age = 99
 y_min_full = {
@@ -367,7 +382,7 @@ params_prior_full = train_surrogate(
 
 ```{code-cell} ipython3
 key_i, key = random.split(key)
-X_lhs_fixed = sample(lhs_parameter_space[0:1], train_samples, key_i)
+X_lhs_fixed = sample(lhs_train_space[0:1], train_samples, key_i)
 y_lhs_fixed = vmap(lambda p: prev_stats_multisite(p, EIRs, etas, full_solution), in_axes=[{n: 0 for n in intrinsic_bounds.name}])(*X_lhs_fixed)
 
 y_min_fixed = (0., min_val)
@@ -540,8 +555,11 @@ def get_curves(params, eirs, etas, impl=full_solution):
     )(params, eirs, etas)
 
 prior_curves = get_curves(prior, EIRs, etas)
-lhs_full_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: full_solution_surrogate(surrogate_lhs_full, params_lhs_full, sort_dict(p), e, a))
 true_curves = get_curves(without_obs(true_values), EIRs, etas)
+```
+
+```{code-cell} ipython3
+lhs_full_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: full_solution_surrogate(surrogate_lhs_full, params_lhs_full, sort_dict(p), e, a))
 ```
 
 ```{code-cell} ipython3
@@ -652,7 +670,9 @@ lhs_full_mcmc = surrogate_posterior_full(surrogate_lhs_full, params_lhs_full, ke
 X_post_lhs_full = lhs_full_mcmc.get_samples()
 y_post_lhs_full = prev_stats_batch(X_post_lhs_full)
 y_post_lhs_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, X_post_lhs_full)
+```
 
+```{code-cell} ipython3
 lhs_fixed_mcmc = surrogate_posterior_fixed(surrogate_lhs_fixed, params_lhs_fixed, key)
 X_post_lhs_fixed = lhs_fixed_mcmc.get_samples()
 y_post_lhs_fixed = prev_stats_batch(X_post_lhs_fixed)
@@ -678,7 +698,7 @@ y_val_prior_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs
 y_val_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed, sort_dict(without_obs(prior)))
 
 key, key_i = random.split(key)
-X_val_lhs = sample(lhs_parameter_space[0], val_size, key_i)
+X_val_lhs = sample(lhs_test_space[0], val_size, key_i)
 y_val_lhs = prev_stats_batch(X_val_lhs)
 y_val_lhs_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, X_val_lhs)
 y_val_lhs_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed, X_val_lhs)
@@ -812,7 +832,13 @@ lhs_fixed_predictive = Predictive(
 from scipy.stats import ks_2samp
 sample_keys = list(posterior_samples.keys())
 ks_data = pd.DataFrame([
-    {'experiment': name, 'variable': k, 'statistic': ks_2samp(posterior_samples[k], posterior[k]).statistic, 'p-value': ks_2samp(posterior_samples[k], posterior[k]).pvalue}
+    {
+        'experiment': name,
+        'variable': k,
+        'statistic': ks_2samp(posterior_samples[k], posterior[k]).statistic,
+        'p-value': ks_2samp(posterior_samples[k], posterior[k]).pvalue,
+        'mean': float(jnp.mean(posterior[k]))
+    }
     for k in sample_keys
     for name, posterior in [
         ('prior_fixed', prior_fixed_mcmc.get_samples()),
@@ -824,7 +850,61 @@ ks_data = pd.DataFrame([
 ```
 
 ```{code-cell} ipython3
-ks_data #TODO: present
+ks_data.pivot(columns='experiment', index='variable').swaplevel(axis='columns').sort_index(axis=1, level=0).loc[[
+        # Pre-erythrocytic immunity
+    'kb',
+    'ub',
+    'b0',
+    'IB0',
+    
+    # Clinical immunity
+    'kc',
+    'uc',
+    'phi0',
+    'phi1',
+    'IC0',
+    'PM',
+    'dm',
+    
+    # Detection immunity
+    'kd',
+    'ud',
+    'd1',
+    'ID0',
+    'fd0',
+    'gd',
+    'ad0',
+    'rU',
+]]
+```
+
+```{code-cell} ipython3
+print(ks_data.pivot(columns='experiment', index='variable').swaplevel(axis='columns').sort_index(axis=1, level=0).loc[[
+        # Pre-erythrocytic immunity
+    'kb',
+    'ub',
+    'b0',
+    'IB0',
+    
+    # Clinical immunity
+    'kc',
+    'uc',
+    'phi0',
+    'phi1',
+    'IC0',
+    'PM',
+    'dm',
+    
+    # Detection immunity
+    'kd',
+    'ud',
+    'd1',
+    'ID0',
+    'fd0',
+    'gd',
+    'ad0',
+    'rU',
+]].style.format(precision=2).to_latex())
 ```
 
 ```{code-cell} ipython3
