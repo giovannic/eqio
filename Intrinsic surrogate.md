@@ -563,6 +563,11 @@ lhs_full_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: full_
 ```
 
 ```{code-cell} ipython3
+lhs_full_active_prior_curves = get_curves(
+    prior, EIRs, etas, impl=lambda p, e, a: full_solution_surrogate(surrogate_lhs_full, params_lhs_full_active, sort_dict(p), e, a))
+```
+
+```{code-cell} ipython3
 n_curves = 500
 fig, axs = plt.subplots(3, len(EIRs), sharey='row', sharex=True)
 imm_labels = ['prob_b', 'prob_c', 'prob_d']
@@ -637,6 +642,95 @@ for i in range(len(EIRs)):
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
 fig.text(0.5, 1, 'LHS full prior pos_M/inc function', ha='center')
+```
+
+```{code-cell} ipython3
+def surrogate_ll_rep(surrogate, surrogate_params, params):
+    surrogate_input = _freeze_attr(params)
+    _, state = surrogate.apply(
+        surrogate_params,
+        surrogate_input,
+        capture_intermediates = True,
+        method = lambda module, x: module.nn(module.vec(module.std(x)))
+    )
+    return state['intermediates']['nn']['Dense_2']['__call__'][0]
+```
+
+```{code-cell} ipython3
+ll_reps = vmap(surrogate_ll_rep, in_axes=[None, None, tree_map(lambda l: 0, X_lhs_full)])(surrogate_lhs_full, params_lhs_full, X_lhs_full)
+```
+
+```{code-cell} ipython3
+trained_information = jnp.sum(
+    vmap(lambda ll_rep: jnp.outer(ll_rep, ll_rep))(ll_reps),
+    axis=0
+)
+```
+
+```{code-cell} ipython3
+def fisher_objective(active_samples):
+    ll_active = vmap(surrogate_ll_rep, in_axes=[None, None, tree_map(lambda l: 0, X_lhs_full)])(surrogate_lhs_full, params_lhs_full, active_samples)
+    new_information = jnp.sum(
+        vmap(lambda ll_rep: jnp.outer(ll_rep, ll_rep))(ll_active),
+        axis=0
+    )
+    return jnp.trace(jnp.matmul(jnp.linalg.inv(trained_information), new_information))
+```
+
+```{code-cell} ipython3
+X_sample = sample(lhs_test_space, 100000, key)
+```
+
+```{code-cell} ipython3
+def reset_parameters(p):
+    return tree_map(lambda leaf, lower, upper: jnp.maximum(jnp.minimum(leaf, upper), lower), p, x_min, x_max)
+```
+
+```{code-cell} ipython3
+import optax
+
+learning_rate = 1e-3
+steps = 10
+optimiser = optax.adam(learning_rate)
+opt_state = optimiser.init(X_active)
+fs = list()
+X_active = X_sample
+for _ in range(steps):
+    f, grads = jax.value_and_grad(lambda x: -fisher_objective(x))(X_active)
+    fs.append(f)
+    updates, opt_state = optimiser.update(grads, opt_state, X_active)
+    X_active = optax.apply_updates(X_active, updates)
+    X_active = reset_parameters(X_active)
+```
+
+```{code-cell} ipython3
+y_active = vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0])(*X_active)
+```
+
+```{code-cell} ipython3
+fs
+```
+
+```{code-cell} ipython3
+plt.hist(X_active[1], bins=100)
+```
+
+```{code-cell} ipython3
+tree_map(lambda a, b: jnp.mean(jnp.abs(a - b)), X_sample, X_active)
+```
+
+```{code-cell} ipython3
+tree_map(lambda a: jnp.mean(a), X_active)
+```
+
+```{code-cell} ipython3
+params_lhs_full_active = train_surrogate(
+    tree_map(lambda a, b: jnp.concatenate([a, b]), X_lhs_full, X_active),
+    tree_map(lambda a, b: jnp.concatenate([a, b]), y_lhs_full, y_active),
+    surrogate_lhs_full,
+    mse,
+    key
+)
 ```
 
 ```{code-cell} ipython3
