@@ -12,6 +12,7 @@ from mox.sampling import LHSStrategy
 import numpyro
 from numpyro.infer import MCMC, NUTS, Predictive
 import numpyro.distributions as dist
+from numpyro.infer.util import log_density
 import arviz as az
 import pandas as pd
 
@@ -19,8 +20,7 @@ import pandas as pd
 key = random.PRNGKey(42)
 n_chains = 10
 
-
-
+max_age = 99
 def full_solution(params, eir, eta):
     p = dmeq.default_parameters()
     for k, v in params.items():
@@ -29,12 +29,12 @@ def full_solution(params, eir, eta):
     p['eta'] = eta
     s = dmeq.solve(p, dtype=jnp.float64)
     return {
-        'pos_M': s[0],
-        'inc': s[1],
-        'prob_b': s[3],
-        'prob_c': s[4],
-        'prob_d': s[5],
-        'prop': s[2],
+        'pos_M': s[0][:max_age],
+        'inc': s[1][:max_age],
+        'prob_b': s[2][:max_age],
+        'prob_c': s[3][:max_age],
+        'prob_d': s[4][:max_age],
+        'prop': s[5][:max_age],
     }
 
 
@@ -89,32 +89,29 @@ from mox.sampling import DistStrategy
 # TODO: take this from the model
 prior_parameter_space = [
     {
-        'kb': DistStrategy(dist.LogNormal(0., .25)),
-        'ub': DistStrategy(dist.LogNormal(0., .25)),
+        'kb': DistStrategy(dist.LogNormal(0., 1.)),
+        'ub': DistStrategy(dist.LogNormal(0., 1.)),
         'b0': DistStrategy(dist.Beta(1., 1.)),
-        'IB0': DistStrategy(dist.LeftTruncatedDistribution(dist.Normal(50., 10.), low=0.)),
-        'kc': DistStrategy(dist.LogNormal(0., .25)),
-        'uc': DistStrategy(dist.LogNormal(0., .25)),
+        'IB0': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(50., 10.), low=0.)),
+        'kc': DistStrategy(dist.LogNormal(0., 1.)),
+        'uc': DistStrategy(dist.LogNormal(0., 1.)),
         'IC0': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(100., 10.), low=0.)),
         'phi0': DistStrategy(dist.Beta(5., 1.)),
         'phi1': DistStrategy(dist.Beta(1., 2.)),
         'PM': DistStrategy(dist.Beta(1., 1.)),
         'dm': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(200., 10.), low=0.)),
-        'kd': DistStrategy(dist.LogNormal(0., .25)),
-        'ud': DistStrategy(dist.LogNormal(0., .25)),
+        'kd': DistStrategy(dist.LogNormal(0., 1.)),
+        'ud': DistStrategy(dist.LogNormal(0., 1.)),
         'd1': DistStrategy(dist.Beta(1., 2.)),
         'ID0': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(25., 1.), low=0.)),
         'fd0': DistStrategy(dist.Beta(1., 1.)),
-        'gd': DistStrategy(dist.LogNormal(0., .25)),
+        'gd': DistStrategy(dist.LogNormal(0., 1.)),
         'ad0': DistStrategy(dist.TruncatedDistribution(
             dist.Cauchy(30. * 365., 365.),
             low=20. * 365.,
             high=40. * 365.
         )),
-        'rU': DistStrategy(dist.LogNormal(0., .25)),
-        'cD': DistStrategy(dist.Beta(1., 2.)),
-        'cU': DistStrategy(dist.Beta(1., 5.)),
-        'g_inf': DistStrategy(dist.LogNormal(0., .25))
+        'rU': DistStrategy(dist.LogNormal(0., 1.))
     },
     DistStrategy(dist.Uniform(0., 500.)), # EIR
     DistStrategy(dist.Uniform(1/(40 * 365), 1/(20 * 365))) # eta
@@ -126,14 +123,14 @@ prior_parameter_space = [
 
 def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
     # Pre-erythrocytic immunity
-    kb = numpyro.sample('kb', dist.LogNormal(0., .25))
-    ub = numpyro.sample('ub', dist.LogNormal(0., .25))
+    kb = numpyro.sample('kb', dist.LogNormal(0., 1.))
+    ub = numpyro.sample('ub', dist.LogNormal(0., 1.))
     b0 = numpyro.sample('b0', dist.Beta(1., 1.))
-    IB0 = numpyro.sample('IB0', dist.LeftTruncatedDistribution(dist.Normal(50., 10.), low=0.))
+    IB0 = numpyro.sample('IB0', dist.LeftTruncatedDistribution(dist.Cauchy(50., 10.), low=0.))
     
     # Clinical immunity
-    kc = numpyro.sample('kc', dist.LogNormal(0., .25))
-    uc = numpyro.sample('uc', dist.LogNormal(0., .25))
+    kc = numpyro.sample('kc', dist.LogNormal(0., 1.))
+    uc = numpyro.sample('uc', dist.LogNormal(0., 1.))
     phi0 = numpyro.sample('phi0', dist.Beta(5., 1.))
     phi1 = numpyro.sample('phi1', dist.Beta(1., 2.))
     IC0 = numpyro.sample('IC0',dist.LeftTruncatedDistribution(dist.Cauchy(100., 10.), low=0.))
@@ -141,24 +138,20 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
     dm = numpyro.sample('dm', dist.LeftTruncatedDistribution(dist.Cauchy(200., 10.), low=0.))
     
     # Detection immunity
-    kd = numpyro.sample('kd', dist.LogNormal(0., .25))
-    ud = numpyro.sample('ud', dist.LogNormal(0., .25))
+    kd = numpyro.sample('kd', dist.LogNormal(0., 1.))
+    ud = numpyro.sample('ud', dist.LogNormal(0., 1.))
     d1 = numpyro.sample('d1', dist.Beta(1., 2.))
     ID0 = numpyro.sample('ID0', dist.LeftTruncatedDistribution(dist.Cauchy(25., 1.), low=0.))
     fd0 = numpyro.sample('fd0', dist.Beta(1., 1.))
-    gd = numpyro.sample('gd', dist.LogNormal(0., .25))
+    gd = numpyro.sample('gd', dist.LogNormal(0., 1.))
     ad0 = numpyro.sample('ad0', dist.TruncatedDistribution(
             dist.Cauchy(30. * 365., 365.),
             low=20. * 365.,
             high=40. * 365.
-        ))
+        )
+    )
     
-    ru = numpyro.sample('rU', dist.LogNormal(0., .25))
-    
-    # FOIM
-    cd = numpyro.sample('cD', dist.Beta(1., 2.))
-    cu = numpyro.sample('cU', dist.Beta(1., 5.))
-    g_inf = numpyro.sample('g_inf', dist.LogNormal(0., .25))
+    ru = numpyro.sample('rU', dist.LogNormal(0., 1.))
     
     x = {
         'kb': kb,
@@ -179,10 +172,7 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
         'fd0': fd0,
         'gd': gd,
         'ad0': ad0,
-        'rU': ru,
-        'cD': cd,
-        'cU': cu,
-        'g_inf': g_inf
+        'rU': ru
     }
     
     prev_stats, inc_stats = impl(x, EIRs, etas)
@@ -190,7 +180,7 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
     numpyro.sample(
         'obs_prev',
         dist.Independent(
-            dist.Binomial(total_count=prev_N, probs=prev_stats, validate_args=True),
+            dist.Binomial(total_count=prev_N, probs=prev_stats.reshape(-1), validate_args=True),
             1
         ),
         obs=prev
@@ -199,12 +189,11 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
     numpyro.sample(
         'obs_inc',
         dist.Independent(
-            dist.Poisson(rate=jnp.maximum(inc_stats, 1e-12)),
+            dist.Poisson(rate=jnp.maximum(inc_stats.reshape(-1), 1e-12)),
             1
         ),
         obs=inc
     )
-
 
 key, key_i = random.split(key)
 true_values = Predictive(model, num_samples=1)(key_i)
@@ -213,28 +202,22 @@ true_values = Predictive(model, num_samples=1)(key_i)
 obs_inc, obs_prev = (true_values['obs_inc'], true_values['obs_prev'])
 
 
-print(pd.DataFrame(
-    jnp.vstack([EIRs, etas, obs_prev[0].T, obs_inc[0].T]).T,
-    columns=['EIR', 'eta', 'prev_2_10', 'prev_10+', 'inc_0_5', 'inc_5_15', 'inc_15+']
-).to_latex(index=False))
-
-
-
 def without_obs(params):
     return {k : v for k, v in params.items() if not k in {'obs_inc', 'obs_prev'}}
 
 
 key, key_i = random.split(key)
-prior = Predictive(model, num_samples=600)(key)
+prior = Predictive(model, num_samples=1000)(key)
 
 
 from jax import pmap, tree_map
 import jax
 import pandas as pd
-from scipy.stats.qmc import LatinHypercube
 
 device_count = len(jax.devices())
 
+max_val = jnp.finfo(jnp.float32).max
+min_val = jnp.finfo(jnp.float32).smallest_normal
 
 # Create the X_lhs dataset
 intrinsic_bounds = pd.DataFrame.from_records([
@@ -249,20 +232,32 @@ intrinsic_bounds = pd.DataFrame.from_records([
     ('phi1', 0, 1),
     ('PM', 0, 1),
     ('dm', 0, 500),
-    ('kd', .01, 10),
+    ('kd', min_val, 10),
     ('ud', 0, 10),
     ('d1', 0, 1),
     ('ID0', 0, 100),
     ('fd0', 0, 1),
     ('gd', 0, 10),
     ('ad0', 20 * 365, 40 * 365),
-    ('rU', 0, 1/100),
-    ('cD', 0, 1),
-    ('cU', 0, 1),
-    ('g_inf', 0, 10)
+    ('rU', 0, 10)
 ], columns=['name', 'lower', 'upper'])
 
-lhs_parameter_space = [
+lhs_train_space = [
+    {
+        name: LHSStrategy(lower, upper)
+        for name, lower, upper in intrinsic_bounds.itertuples(index=False)
+    },
+    DistStrategy(dist.MixtureGeneral(
+        dist.Categorical(probs=jnp.array([.25, .75])),
+        [
+            dist.TruncatedDistribution(dist.Normal(0., .05), low=0., high=500.),
+            dist.Uniform(0., 500.)
+        ]
+    )),
+    LHSStrategy(1/(40 * 365), 1/(20 * 365))
+]
+
+lhs_test_space = [
     {
         name: LHSStrategy(lower, upper)
         for name, lower, upper in intrinsic_bounds.itertuples(index=False)
@@ -271,28 +266,11 @@ lhs_parameter_space = [
     LHSStrategy(1/(40 * 365), 1/(20 * 365))
 ]
 
-x_min = [{
-    name: lower
-    for name, lower, _ in intrinsic_bounds.itertuples(index=False)
-}]
-
-x_max = [{
-    name: upper
-    for name, _, upper in intrinsic_bounds.itertuples(index=False)
-}]
-
 
 # In[20]:
 
 
 print(pd.concat([intrinsic_bounds]).to_latex(index=False, float_format="{:0.0f}".format))
-
-
-# In[21]:
-
-
-max_val = jnp.finfo(jnp.float32).max
-min_val = jnp.finfo(jnp.float32).smallest_normal
 
 
 # In[22]:
@@ -301,25 +279,26 @@ min_val = jnp.finfo(jnp.float32).smallest_normal
 from mox.sampling import sample
 from mox.surrogates import make_surrogate, pytree_init
 from mox.training import train_surrogate
-from mox.loss import mse
+from mox.loss import make_regularised_predictive_loss, mse
 
+loss = make_regularised_predictive_loss(mse, 1e-4)
 
 y_min_full = {
-    'pos_M': jnp.full((100,), 0.),
-    'inc': jnp.full((100,), 0.),
-    'prob_b': jnp.full((100,), 0.),
-    'prob_c': jnp.full((100,), 0.),
-    'prob_d': jnp.full((100,), 0.),
-    'prop': jnp.full((100,), min_val)
+    'pos_M': jnp.full((max_age,), 0.),
+    'inc': jnp.full((max_age,), 0.),
+    'prob_b': jnp.full((max_age,), 0.),
+    'prob_c': jnp.full((max_age,), 0.),
+    'prob_d': jnp.full((max_age,), 0.),
+    'prop': jnp.full((max_age,), min_val)
 }
 
 y_max_full = {
-    'pos_M': jnp.full((100,), 1.),
-    'inc': jnp.full((100,), max_val),
-    'prob_b': jnp.full((100,), 1.),
-    'prob_c': jnp.full((100,), 1.),
-    'prob_d': jnp.full((100,), 1.),
-    'prop': jnp.full((100,), 1.)
+    'pos_M': jnp.full((max_age,), 1.),
+    'inc': jnp.full((max_age,), 1.),
+    'prob_b': jnp.full((max_age,), 1.),
+    'prob_c': jnp.full((max_age,), 1.),
+    'prob_d': jnp.full((max_age,), 1.),
+    'prop': jnp.full((max_age,), 1.)
 }
 
 y_min_fixed = (0., min_val)
@@ -396,10 +375,10 @@ def surrogate_posterior(surrogate, params, key, impl):
     return mcmc
 
 
-val_size = int(1e4)
+val_size = int(1e5)
 y_val_prior = prev_stats_batch(without_obs(prior))
 key, key_i = random.split(key)
-X_val_lhs = sample(lhs_parameter_space[0], val_size, key_i)
+X_val_lhs = sample(lhs_test_space[0], val_size, key_i)
 y_val_lhs = prev_stats_batch(X_val_lhs)
 
 
@@ -452,8 +431,10 @@ posterior_samples = mcmc.get_samples()
 def run_pipeline(train_samples, key):
 
     key_i, key = random.split(key)
-    X_lhs_full = sample(lhs_parameter_space, train_samples, key_i)
+    X_lhs_full = sample(lhs_test_space, train_samples, key_i)
+    X_lhs_full_tuned = sample(lhs_train_space, train_samples, key_i)
     y_lhs_full = vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0])(*X_lhs_full)
+    y_lhs_full_tuned = vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0])(*X_lhs_full_tuned)
 
     surrogate_lhs_full = make_surrogate(
         X_lhs_full,
@@ -466,9 +447,17 @@ def run_pipeline(train_samples, key):
         X_lhs_full,
         y_lhs_full,
         surrogate_lhs_full,
-        mse,
+        loss,
         key_i
     )
+    params_lhs_full_tuned = train_surrogate(
+        X_lhs_full_tuned,
+        y_lhs_full_tuned,
+        surrogate_lhs_full,
+        loss,
+        key_i
+    )
+
 
     key_i, key = random.split(key)
     X_prior_full = sample(prior_parameter_space, train_samples, key_i)
@@ -485,12 +474,12 @@ def run_pipeline(train_samples, key):
         X_prior_full,
         y_prior_full,
         surrogate_prior_full,
-        mse,
+        loss,
         key_i
     )
 
     key_i, key = random.split(key)
-    X_lhs_fixed = sample(lhs_parameter_space[0:1], train_samples, key_i)
+    X_lhs_fixed = sample(lhs_test_space[0:1], train_samples, key_i)
     y_lhs_fixed = vmap(lambda p: prev_stats_multisite(p, EIRs, etas, full_solution), in_axes=[{n: 0 for n in intrinsic_bounds.name}])(*X_lhs_fixed)
 
     surrogate_lhs_fixed = make_surrogate(
@@ -504,7 +493,7 @@ def run_pipeline(train_samples, key):
         X_lhs_fixed,
         y_lhs_fixed,
         surrogate_lhs_fixed,
-        mse,
+        loss,
         key_i
     )
 
@@ -524,7 +513,7 @@ def run_pipeline(train_samples, key):
         X_prior_fixed,
         y_prior_fixed,
         surrogate_prior_fixed,
-        mse,
+        loss,
         key_i
     )
     
@@ -532,11 +521,17 @@ def run_pipeline(train_samples, key):
     save_model(f'prior_full_{train_samples}', surrogate_prior_full, params_prior_full)
     save_model(f'lhs_fixed_{train_samples}', surrogate_lhs_fixed, params_lhs_fixed)
     save_model(f'lhs_full_{train_samples}', surrogate_lhs_full, params_lhs_full)
+    save_model(f'lhs_full_tuned_{train_samples}', surrogate_lhs_full, params_lhs_full_tuned)
 
     lhs_full_mcmc = surrogate_posterior_full(surrogate_lhs_full, params_lhs_full, key)
     X_post_lhs_full = lhs_full_mcmc.get_samples()
     y_post_lhs_full = prev_stats_batch(X_post_lhs_full)
     y_post_lhs_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, X_post_lhs_full)
+    
+    lhs_full_tuned_mcmc = surrogate_posterior_full(surrogate_lhs_full, params_lhs_full_tuned, key)
+    X_post_lhs_full_tuned = lhs_full_tuned_mcmc.get_samples()
+    y_post_lhs_full_tuned = prev_stats_batch(X_post_lhs_full_tuned)
+    y_post_lhs_full_tuned_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full_tuned, X_post_lhs_full_tuned)
 
     lhs_fixed_mcmc = surrogate_posterior_fixed(surrogate_lhs_fixed, params_lhs_fixed, key)
     X_post_lhs_fixed = lhs_fixed_mcmc.get_samples()
@@ -555,9 +550,11 @@ def run_pipeline(train_samples, key):
     y_post_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fixed, params_prior_fixed, X_post_prior_fixed)
 
     y_val_prior_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, sort_dict(without_obs(prior)))
+    y_val_prior_full_tuned_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full_tuned, sort_dict(without_obs(prior)))
     y_val_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed, sort_dict(without_obs(prior)))
 
     y_val_lhs_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, X_val_lhs)
+    y_val_lhs_full_tuned_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full_tuned, X_val_lhs)
     y_val_lhs_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed, X_val_lhs)
 
     y_val_prior_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, params_prior_full, sort_dict(without_obs(prior)))
@@ -567,10 +564,10 @@ def run_pipeline(train_samples, key):
     y_val_lhs_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fixed, params_prior_fixed, X_val_lhs)
 
     approximation_error(
-        ['lhs_full'] * 3 + ['lhs_fixed'] * 3 + ['prior_full'] * 3 + ['prior_fixed'] * 3,
-        ['prior', 'lhs', 'posterior'] * 4,
-        [y_val_prior, y_val_lhs, y_post_lhs_full, y_val_prior, y_val_lhs, y_post_lhs_fixed, y_val_prior, y_val_lhs, y_post_prior_full, y_val_prior, y_val_lhs, y_post_prior_fixed],
-        [y_val_prior_full_hat, y_val_lhs_full_hat, y_post_lhs_full_hat, y_val_prior_fixed_hat, y_val_lhs_fixed_hat, y_post_lhs_fixed_hat,
+        ['lhs_full'] * 3 + ['lhs_full_tuned'] * 3 + ['lhs_fixed'] * 3 + ['prior_full'] * 3 + ['prior_fixed'] * 3,
+        ['prior', 'lhs', 'posterior'] * 5,
+        [y_val_prior, y_val_lhs, y_post_lhs_full, y_val_prior, y_val_lhs, y_post_lhs_full_tuned, y_val_prior, y_val_lhs, y_post_lhs_fixed, y_val_prior, y_val_lhs, y_post_prior_full, y_val_prior, y_val_lhs, y_post_prior_fixed],
+        [y_val_prior_full_hat, y_val_lhs_full_hat, y_post_lhs_full_hat, y_val_prior_full_tuned_hat, y_val_lhs_full_tuned_hat, y_post_lhs_full_tuned_hat, y_val_prior_fixed_hat, y_val_lhs_fixed_hat, y_post_lhs_fixed_hat,
          y_val_prior_prior_full_hat, y_val_lhs_prior_full_hat, y_post_prior_full_hat, y_val_prior_prior_fixed_hat, y_val_lhs_prior_fixed_hat, y_post_prior_fixed_hat]
     ).to_csv(f'{train_samples}_approx_error.csv', index=False)
     
@@ -583,15 +580,18 @@ def run_pipeline(train_samples, key):
             ('prior_fixed', prior_fixed_mcmc.get_samples()),
             ('prior_full', prior_full_mcmc.get_samples()),
             ('lhs_fixed', lhs_fixed_mcmc.get_samples()),
-            ('lhs_full', lhs_full_mcmc.get_samples())
+            ('lhs_full', lhs_full_mcmc.get_samples()),
+            ('lhs_full_tuned', lhs_full_tuned_mcmc.get_samples())
         ]
     ]).to_csv(f'{train_samples}_ks_error.csv', index=False)
     
-for n_batches in jnp.linspace(int(10), int(5e3), num=10, dtype=jnp.int64):
-    train_samples = n_batches * 100
+for n_batches in jnp.linspace(int(10), int(2e3), num=10, dtype=jnp.int64):
+    train_samples = int(n_batches * 100)
     try:
         run_pipeline(train_samples, key)
     except Exception as e:
+        import traceback
         print(train_samples)
         print(e)
+        print(traceback.format_exc())
         pass

@@ -219,13 +219,6 @@ obs_inc, obs_prev = (true_values['obs_inc'], true_values['obs_prev'])
 ```
 
 ```{code-cell} ipython3
-print(pd.DataFrame(
-    jnp.vstack([EIRs, etas, obs_prev.reshape((len(EIRs), 2)).T, obs_inc.reshape((len(EIRs), 3)).T]).T,
-    columns=['EIR', 'eta', 'prev_2_10', 'prev_10+', 'inc_0_5', 'inc_5_15', 'inc_15+']
-).to_latex(index=False))
-```
-
-```{code-cell} ipython3
 def without_obs(params):
     return {k : v for k, v in params.items() if not k in {'obs_inc', 'obs_prev'}}
 ```
@@ -239,7 +232,6 @@ prior = Predictive(model, num_samples=1000)(key)
 from jax import pmap, tree_map
 import jax
 import pandas as pd
-from scipy.stats.qmc import LatinHypercube
 
 train_samples = int(1e5)
 device_count = len(jax.devices())
@@ -259,7 +251,7 @@ intrinsic_bounds = pd.DataFrame.from_records([
     ('IB0', 0, 100),
     ('kc', 0, 10),
     ('uc', 0, 10),
-    ('IC0', 0, 200),
+    ('IC0', 0, 400),
     ('phi0', 0, 1),
     ('phi1', 0, 1),
     ('PM', 0, 1),
@@ -271,7 +263,7 @@ intrinsic_bounds = pd.DataFrame.from_records([
     ('fd0', 0, 1),
     ('gd', 0, 10),
     ('ad0', 20 * 365, 40 * 365),
-    ('rU', 0, 1),
+    ('rU', 0, 10),
 ], columns=['name', 'lower', 'upper'])
 
 lhs_train_space = [
@@ -310,20 +302,21 @@ x_max = [{
 ```
 
 ```{code-cell} ipython3
-print(pd.concat([intrinsic_bounds]).to_latex(index=False, float_format="{:0.0f}".format))
+print(pd.concat([intrinsic_bounds]).to_latex(index=False, float_format="{:g}".format))
 ```
 
 ```{code-cell} ipython3
 from mox.sampling import sample
 from mox.surrogates import make_surrogate, pytree_init
 from mox.training import train_surrogate
-from mox.loss import mse
+from mox.loss import make_regularised_predictive_loss, mse
 ```
 
 ```{code-cell} ipython3
 key_i, key = random.split(key)
-X_lhs_full = sample(lhs_train_space, train_samples, key_i)
+X_lhs_full = sample(lhs_test_space, train_samples, key_i)
 y_lhs_full = vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0])(*X_lhs_full)
+
 max_age = 99
 y_min_full = {
     'pos_M': jnp.full((max_age,), 0.),
@@ -336,13 +329,51 @@ y_min_full = {
 
 y_max_full = {
     'pos_M': jnp.full((max_age,), 1.),
-    'inc': jnp.full((max_age,), max_val),
+    'inc': jnp.full((max_age,), 1.),
     'prob_b': jnp.full((max_age,), 1.),
     'prob_c': jnp.full((max_age,), 1.),
     'prob_d': jnp.full((max_age,), 1.),
     'prop': jnp.full((max_age,), 1.)
 }
+```
 
+```{code-cell} ipython3
+X_lhs_full_tuned = sample(lhs_train_space, train_samples, key_i)
+y_lhs_full_tuned = vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0])(*X_lhs_full_tuned)
+```
+
+```{code-cell} ipython3
+loss = make_regularised_predictive_loss(mse, 1e-5)
+```
+
+```{code-cell} ipython3
+import optax
+```
+
+```{code-cell} ipython3
+def create_optimiser(warmup_epochs, base_learning_rate, steps_per_epoch):
+    """Creates learning rate schedule."""
+    warmup_fn = optax.linear_schedule(
+        init_value=0.,
+        end_value=base_learning_rate,
+        transition_steps=warmup_epochs * steps_per_epoch
+    )
+    cosine_epochs = max(epochs - warmup_epochs, 1)
+    cosine_fn = optax.cosine_decay_schedule(
+        init_value=base_learning_rate,
+        decay_steps=cosine_epochs * steps_per_epoch)
+    schedule_fn = optax.join_schedules(
+        schedules=[warmup_fn, cosine_fn],
+        boundaries=[warmup_epochs * steps_per_epoch])
+    return optax.adam(learning_rate=schedule_fn)
+
+batch_size = 100
+epochs = 150
+warmup_epochs = 50
+base_lr = 1e-4
+```
+
+```{code-cell} ipython3
 surrogate_lhs_full = make_surrogate(
     X_lhs_full,
     y_lhs_full,
@@ -354,7 +385,19 @@ params_lhs_full = train_surrogate(
     X_lhs_full,
     y_lhs_full,
     surrogate_lhs_full,
-    mse,
+    loss,
+    key_i,
+    optimiser = create_optimiser(warmup_epochs, base_lr, train_samples / batch_size),
+    epochs = epochs
+)
+```
+
+```{code-cell} ipython3
+params_lhs_full_tuned = train_surrogate(
+    X_lhs_full_tuned,
+    y_lhs_full_tuned,
+    surrogate_lhs_full,
+    loss,
     key_i
 )
 ```
@@ -375,7 +418,7 @@ params_prior_full = train_surrogate(
     X_prior_full,
     y_prior_full,
     surrogate_prior_full,
-    mse,
+    loss,
     key_i
 )
 ```
@@ -399,7 +442,7 @@ params_lhs_fixed = train_surrogate(
     X_lhs_fixed,
     y_lhs_fixed,
     surrogate_lhs_fixed,
-    mse,
+    loss,
     key_i
 )
 ```
@@ -420,7 +463,7 @@ params_prior_fixed = train_surrogate(
     X_prior_fixed,
     y_prior_fixed,
     surrogate_prior_fixed,
-    mse,
+    loss,
     key_i
 )
 ```
@@ -560,6 +603,7 @@ true_curves = get_curves(without_obs(true_values), EIRs, etas)
 
 ```{code-cell} ipython3
 lhs_full_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: full_solution_surrogate(surrogate_lhs_full, params_lhs_full, sort_dict(p), e, a))
+lhs_full_tuned_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: full_solution_surrogate(surrogate_lhs_full, params_lhs_full_tuned, sort_dict(p), e, a))
 ```
 
 ```{code-cell} ipython3
@@ -636,7 +680,27 @@ for i in range(len(EIRs)):
         
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
-fig.text(0.5, 1, 'LHS full prior pos_M/inc function', ha='center')
+fig.text(0.5, 1, 'lhs_full surrogate prior pos_M/inc function', ha='center')
+```
+
+```{code-cell} ipython3
+fig, axs = plt.subplots(2, len(EIRs), sharey='row', sharex=True)
+
+prev_labels = ['pos_M', 'inc']
+for i in range(len(EIRs)):
+    for prev_i, prev in enumerate(prev_labels):
+        axs[0, i].set_xlabel(
+            f'EIR: {EIRs[i]}'
+        )
+        axs[0, i].xaxis.set_label_position('top')
+        axs[prev_i, i].plot(lhs_full_tuned_prior_curves[prev][i, :n_curves, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(true_curves[prev][i, 0, :])
+        axs[prev_i, 0].set_ylabel(prev)
+        #axs[prev_i, 0].set_yscale('log')
+        
+fig.tight_layout()
+fig.text(0.5, 0, 'Age (years)', ha='center')
+fig.text(0.5, 1, 'lhs_full_tuned surrogate prior pos_M/inc function', ha='center')
 ```
 
 ```{code-cell} ipython3
@@ -1002,4 +1066,97 @@ for i in range(len(EIRs)):
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
 fig.text(0.5, 1, 'Surrogate posterior pos_M/inc function', ha='center')
+```
+
+# Convergence
+
+```{code-cell} ipython3
+from glob import glob
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+```
+
+```{code-cell} ipython3
+samples = [int(path.split('_')[0]) for path in glob('*_approx_error.csv')]
+```
+
+```{code-cell} ipython3
+approx_error = pd.concat([
+    pd.read_csv(f'{s}_approx_error.csv').assign(samples=s)
+    for s in samples
+])
+```
+
+```{code-cell} ipython3
+ks_error = pd.concat([
+    pd.read_csv(f'{s}_ks_error.csv').assign(samples=s)
+    for s in samples
+])
+```
+
+```{code-cell} ipython3
+fig, axs = plt.subplots(1, 3, figsize=(19.7, 8.27))
+for ax, test_set in zip(axs, ['prior', 'lhs', 'posterior']):
+    sns.lineplot(data=approx_error[approx_error.test_set == test_set], x='samples', y='RE', hue='experiment', ax=ax)
+    ax.tick_params(axis='x', labelrotation=45)
+    if test_set == 'prior':
+        ax.set_ylabel('Relative Error')
+        ax.get_legend().remove()
+    elif test_set == 'lhs':
+        ax.get_legend().remove()
+        ax.set_ylabel('')
+    else:
+        ax.set_ylabel('')
+    ax.set_title(f'{test_set} test set') 
+    ax.set_yscale('log')
+fig.text(0.5, .95, 'Approximation error', ha='center')
+```
+
+```{code-cell} ipython3
+from matplotlib.ticker import FormatStrFormatter
+fig, axs = plt.subplots(1, 3, figsize=(19.7, 8.27))
+for ax, test_set in zip(axs, ['prior', 'lhs', 'posterior']):
+    approx_ks = pd.merge(
+        approx_error[(approx_error.test_set == test_set)].groupby(['experiment', 'samples']).agg({'RE': 'mean'}).reset_index(),
+        ks_error.groupby(['experiment', 'samples']).agg({'statistic': 'mean'}).reset_index()
+    )
+    sns.pointplot(approx_ks, x='statistic', y='RE', hue='experiment', linestyles='none', ax=ax)
+
+    ax.set_xlabel('KS Statistic')
+    labels = [item.get_text() for item in ax.get_xticklabels()]
+    # Beat them into submission and set them back again
+    ax.set_xticklabels([str(round(float(label), 2)) for label in labels])
+    for n, label in enumerate(ax.xaxis.get_ticklabels()):
+        if n % 4 != 0:
+            label.set_visible(False)
+    if test_set == 'prior':
+        ax.set_ylabel('Relative Error')
+        ax.get_legend().remove()
+    elif test_set == 'lhs':
+        ax.get_legend().remove()
+        ax.set_ylabel('')
+    else:
+        ax.set_ylabel('')
+    ax.set_title(f'{test_set} test set') 
+    ax.set_yscale('log')
+fig.text(0.5, .95, 'Relationship of approximation error with posterior alignment', ha='center')
+```
+
+```{code-cell} ipython3
+fig, ax = plt.subplots(figsize=(19.7, 8.27))
+sns.barplot(
+    ks_error[ks_error.samples == max(ks_error.samples)],
+    x='variable',
+    y='statistic',
+    hue='experiment',
+    ax=ax
+)
+ax.set_xlabel('Intrinsic Parameter')
+ax.set_ylabel('KS statistic')
+ax.set_title('Agreement with original posterior')
+```
+
+```{code-cell} ipython3
+
 ```
