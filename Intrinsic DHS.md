@@ -114,6 +114,7 @@ prev_lower = jnp.floor(prev_data.PR_LAR.values)
 prev_upper = jnp.ceil(prev_data.PR_UAR.values)
 inc_lower = jnp.floor(inc_data.INC_LAR.values)
 inc_upper = jnp.ceil(inc_data.INC_UAR.values)
+inc_risk_time = jnp.array(inc_data.PYO.values) * 365.
 n_sites = len(sites)
 ```
 
@@ -131,7 +132,8 @@ inc_stats_multisite = vmap(
 
 ```{code-cell} ipython3
 def model(prev_n=None, prev_pos=None, inc_risk_time=None, inc_n=None, impl=full_solution):
-    est_EIR = numpyro.sample('EIR', dist.Uniform(jnp.zeros((n_sites,)), jnp.full((n_sites,), 500.)))
+    with numpyro.plate('sites', n_sites):
+        EIR = numpyro.sample('EIR', dist.Uniform(0., 1000.))
 
     # Pre-erythrocytic immunity
     kb = numpyro.sample('kb', dist.LogNormal(0., 1.))
@@ -188,7 +190,7 @@ def model(prev_n=None, prev_pos=None, inc_risk_time=None, inc_n=None, impl=full_
 
     prev_stats = prev_stats_multisite(
         x,
-        est_EIR[prev_i],
+        EIR[prev_i],
         prev_eta,
         prev_lower,
         prev_upper,
@@ -197,7 +199,7 @@ def model(prev_n=None, prev_pos=None, inc_risk_time=None, inc_n=None, impl=full_
 
     inc_stats = inc_stats_multisite(
         x,
-        est_EIR[inc_i],
+        EIR[inc_i],
         inc_eta,
         inc_lower,
         inc_upper,
@@ -230,7 +232,7 @@ def without_obs(params):
 
 ```{code-cell} ipython3
 key, key_i = random.split(key)
-prior = Predictive(model, num_samples=100)(key_i, prev_n=prev_data.N.values, inc_risk_time=inc_data.PYO.values)
+prior = Predictive(model, num_samples=100)(key_i, prev_n=prev_data.N.values, inc_risk_time=inc_risk_time)
 ```
 
 ```{code-cell} ipython3
@@ -250,7 +252,7 @@ def densities(p, model):
         {
             'prev_n': prev_data.N.values,
             'prev_pos': prev_data.N_POS.values,
-            'inc_risk_time': inc_data.PYO.values,
+            'inc_risk_time': inc_risk_time,
             'inc_n': inc_data.d.values
         },
         p
@@ -305,14 +307,6 @@ ax = az.plot_ppc(az_prior, group="prior")
 ```
 
 ```{code-cell} ipython3
-plt.hist(prior['obs_inc'].reshape(-1), bins=100)
-```
-
-```{code-cell} ipython3
-plt.hist(inc_data.d, bins=100)
-```
-
-```{code-cell} ipython3
 n_samples = 100
 n_warmup = 100
 
@@ -326,7 +320,7 @@ mcmc = MCMC(
 mcmc.run(key, **{
             'prev_n': prev_data.N.values,
             'prev_pos': prev_data.N_POS.values,
-            'inc_risk_time': inc_data.PYO.values,
+            'inc_risk_time': inc_risk_time,
             'inc_n': inc_data.d.values
         })
 mcmc.print_summary(prob=0.7)
