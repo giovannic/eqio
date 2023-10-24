@@ -12,6 +12,17 @@ kernelspec:
   name: python3
 ---
 
+# TODO
+
+ * calculate approximation error
+ * reduce dropout
+ * remove batch_norm
+ * inductive bias
+ * remove standardisation?
+ * more samples
+ * remove immunity outputs?
+ * weight by the likelihood?
+
 ```{code-cell} ipython3
 cpu_count = 100
 import os
@@ -19,6 +30,11 @@ os.environ['XLA_FLAGS'] = f'--xla_force_host_platform_device_count={cpu_count}'
 import matplotlib.pyplot as plt
 import jax.numpy as jnp
 from jax import random, jit, vmap
+import jax
+
+#jax.config.update('jax_platform_name', 'cpu') # for memory purposes
+cpu_device = jax.devices('cpu')[0]
+gpu_device = jax.devices('gpu')[0]
 ```
 
 ```{code-cell} ipython3
@@ -43,6 +59,7 @@ key = random.PRNGKey(42)
 ```
 
 ```{code-cell} ipython3
+@jax.jit
 def full_solution(params, eir, eta):
     max_age = 99
     p = dmeq.default_parameters()
@@ -62,24 +79,21 @@ def full_solution(params, eir, eta):
 ```
 
 ```{code-cell} ipython3
-population = 1_000_000
+person_risk_time = 1_000 * 365.
 prev_N = 1_000
 
 def prev_stats(solution):
-    inc_rates = solution['inc'] * solution['prop'] * population
+    inc_rates = solution['inc'] * solution['prop']
     return (
         jnp.array([
             solution['pos_M'][3:10].sum() / solution['prop'][3:10].sum(), # Prev 2 - 10
             solution['pos_M'][10:].sum() / solution['prop'][10:].sum(), # Prev 10+
         ]),
-        jnp.maximum(
-            jnp.array([
-                inc_rates[:5].sum(), # Inc 0 - 5
-                inc_rates[5:15].sum(), # Inc 5 - 15
-                inc_rates[15:].sum() # Inc 15+
-            ]),
-            1e-12
-        )
+        jnp.array([
+            solution['inc'][:5].sum() / solution['prop'][:5].sum(), # Inc 0 - 5
+            solution['inc'][5:15].sum() / solution['prop'][5:15].sum(), # Inc 5 - 15
+            solution['inc'][15:].sum() / solution['prop'][15:].sum() # Inc 15+
+        ])
     )
 ```
 
@@ -91,9 +105,10 @@ prev_stats_multisite = vmap(
 ```
 
 ```{code-cell} ipython3
-EIRs = jnp.array([0.05, 3.9, 15., 20., 100., 150., 418.])
+EIRs = jnp.array([0.05, .5, .1, 1., 3.9, 15., 20., 100., 150., 418.])
+n_sites = EIRs.shape[0]
 key, key_i = random.split(key)
-etas = 1. / random.uniform(key_i, shape=EIRs.shape, minval=20*365, maxval=40*365, dtype=jnp.float64)
+etas = 1. / random.uniform(key_i, shape=(n_sites,), minval=40*365, maxval=100*365, dtype=jnp.float64)
 ```
 
 ```{code-cell} ipython3
@@ -101,8 +116,39 @@ from mox.sampling import DistStrategy
 ```
 
 ```{code-cell} ipython3
+class SiteDistribution(dist.Distribution):
+
+    def __init__(self, sites, eir_std, validate_args=False):
+        self.sites = sites
+        self.EIR_dist = dist.TruncatedDistribution(dist.Normal(loc=sites['EIR'], std=eir_std), 0., 1000.)
+
+    def sample(self, key, sample_shape=()):
+        assert is_prng_key(key)
+        key_index, key_normal = random.split(key)
+        index = random.choice(key_index, sample_shape, len(self.sites['EIR']))
+        EIRs = self.EIR_dist.sample(sample_shape)[index]
+        sites = tree_map(lambda leaf: leaf[index], self.sites)
+        sites['EIR'] = EIRs
+        return sites
+
+    def log_prob(self, value):
+        raise NotImplementedError()
+
+    @property
+    def mean(self):
+        raise NotImplementedError()
+
+    @property
+    def variance(self):
+        raise NotImplementedError()
+
+    def cdf(self, value):
+        raise NotImplementedError()
+```
+
+```{code-cell} ipython3
 # TODO: take this from the model
-prior_parameter_space = [
+prior_train_space = [
     {
         'kb': DistStrategy(dist.LogNormal(0., 1.)),
         'ub': DistStrategy(dist.LogNormal(0., 1.)),
@@ -122,19 +168,64 @@ prior_parameter_space = [
         'fd0': DistStrategy(dist.Beta(1., 1.)),
         'gd': DistStrategy(dist.LogNormal(0., 1.)),
         'ad0': DistStrategy(dist.TruncatedDistribution(
-            dist.Cauchy(30. * 365., 365.),
-            low=20. * 365.,
-            high=40. * 365.
+            dist.Cauchy(70. * 365., 365.),
+            low=40. * 365.,
+            high=100. * 365.
+        )),
+        'rU': DistStrategy(dist.LogNormal(0., 1.))
+    },
+    DistStrategy( #Sample using SiteDistribution
+        dist.MixtureSameFamily(
+            dist.Categorical(jnp.full(EIRs.shape, 1 / len(EIRs))),
+            dist.TruncatedDistribution(dist.Normal(EIRs, 10.), 0., 1000.)
+        )
+    ),
+    DistStrategy(
+        dist.MixtureSameFamily(
+            dist.Categorical(jnp.full(etas.shape, 1 / len(etas))),
+            dist.TruncatedDistribution(dist.Normal(etas, 1e-5), 1e-6, 1e-4)
+        )
+    )
+    #DistStrategy(dist.Uniform(0., 500.)), # EIR
+    #DistStrategy(dist.Uniform(1/(100 * 365), 1/(40 * 365))) # eta
+]
+
+prior_test_space = [
+    {
+        'kb': DistStrategy(dist.LogNormal(0., 1.)),
+        'ub': DistStrategy(dist.LogNormal(0., 1.)),
+        'b0': DistStrategy(dist.Beta(1., 1.)),
+        'IB0': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(50., 10.), low=0.)),
+        'kc': DistStrategy(dist.LogNormal(0., 1.)),
+        'uc': DistStrategy(dist.LogNormal(0., 1.)),
+        'IC0': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(100., 10.), low=0.)),
+        'phi0': DistStrategy(dist.Beta(5., 1.)),
+        'phi1': DistStrategy(dist.Beta(1., 2.)),
+        'PM': DistStrategy(dist.Beta(1., 1.)),
+        'dm': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(200., 10.), low=0.)),
+        'kd': DistStrategy(dist.LogNormal(0., 1.)),
+        'ud': DistStrategy(dist.LogNormal(0., 1.)),
+        'd1': DistStrategy(dist.Beta(1., 2.)),
+        'ID0': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(25., 1.), low=0.)),
+        'fd0': DistStrategy(dist.Beta(1., 1.)),
+        'gd': DistStrategy(dist.LogNormal(0., 1.)),
+        'ad0': DistStrategy(dist.TruncatedDistribution(
+            dist.Cauchy(70. * 365., 365.),
+            low=40. * 365.,
+            high=100. * 365.
         )),
         'rU': DistStrategy(dist.LogNormal(0., 1.))
     },
     DistStrategy(dist.Uniform(0., 500.)), # EIR
-    DistStrategy(dist.Uniform(1/(40 * 365), 1/(20 * 365))) # eta
+    DistStrategy(dist.Uniform(1/(100 * 365), 1/(40 * 365))) # eta
 ]
 ```
 
 ```{code-cell} ipython3
 def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
+    with numpyro.plate('sites', n_sites):
+        EIR = numpyro.sample('EIR', dist.Uniform(0., 500.))
+    
     # Pre-erythrocytic immunity
     kb = numpyro.sample('kb', dist.LogNormal(0., 1.))
     ub = numpyro.sample('ub', dist.LogNormal(0., 1.))
@@ -158,9 +249,9 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
     fd0 = numpyro.sample('fd0', dist.Beta(1., 1.))
     gd = numpyro.sample('gd', dist.LogNormal(0., 1.))
     ad0 = numpyro.sample('ad0', dist.TruncatedDistribution(
-            dist.Cauchy(30. * 365., 365.),
-            low=20. * 365.,
-            high=40. * 365.
+            dist.Cauchy(70. * 365., 365.),
+            low=40. * 365.,
+            high=100. * 365.
         )
     )
     
@@ -188,7 +279,7 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
         'rU': ru
     }
     
-    prev_stats, inc_stats = impl(x, EIRs, etas)
+    prev_stats, inc_stats = impl(x, EIR, etas)
     
     numpyro.sample(
         'obs_prev',
@@ -202,7 +293,7 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
     numpyro.sample(
         'obs_inc',
         dist.Independent(
-            dist.Poisson(rate=jnp.maximum(inc_stats.reshape(-1), 1e-12)),
+            dist.Poisson(rate=jnp.maximum(inc_stats.reshape(-1) * person_risk_time, 1e-12)),
             1
         ),
         obs=inc
@@ -241,7 +332,7 @@ import jax
 import pandas as pd
 from scipy.stats.qmc import LatinHypercube
 
-train_samples = int(1e5)
+train_samples = int(1e6)
 device_count = len(jax.devices())
 ```
 
@@ -286,7 +377,7 @@ lhs_train_space = [
             dist.Uniform(0., 500.)
         ]
     )),
-    LHSStrategy(1/(40 * 365), 1/(20 * 365))
+    LHSStrategy(1/(100 * 365), 1/(40 * 365))
 ]
 
 lhs_test_space = [
@@ -295,7 +386,7 @@ lhs_test_space = [
         for name, lower, upper in intrinsic_bounds.itertuples(index=False)
     },
     LHSStrategy(0., 500.),
-    LHSStrategy(1/(40 * 365), 1/(20 * 365))
+    LHSStrategy(1/(100 * 365), 1/(40 * 365))
 ]
 
 x_min = [{
@@ -321,9 +412,6 @@ from mox.loss import mse
 ```
 
 ```{code-cell} ipython3
-key_i, key = random.split(key)
-X_lhs_full = sample(lhs_train_space, train_samples, key_i)
-y_lhs_full = vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0])(*X_lhs_full)
 max_age = 99
 y_min_full = {
     'pos_M': jnp.full((max_age,), 0.),
@@ -331,7 +419,7 @@ y_min_full = {
     'prob_b': jnp.full((max_age,), 0.),
     'prob_c': jnp.full((max_age,), 0.),
     'prob_d': jnp.full((max_age,), 0.),
-    'prop': jnp.full((max_age,), min_val)
+    'prop': jnp.full((max_age,), 1e-12)
 }
 
 y_max_full = {
@@ -342,6 +430,12 @@ y_max_full = {
     'prob_d': jnp.full((max_age,), 1.),
     'prop': jnp.full((max_age,), 1.)
 }
+```
+
+```{code-cell} ipython3
+key_i, key = random.split(key)
+X_lhs_full = sample(lhs_train_space, train_samples, key_i)
+y_lhs_full = vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0])(*X_lhs_full)
 
 surrogate_lhs_full = make_surrogate(
     X_lhs_full,
@@ -360,23 +454,30 @@ params_lhs_full = train_surrogate(
 ```
 
 ```{code-cell} ipython3
+from flax.linen.module import _freeze_attr
 key_i, key = random.split(key)
-X_prior_full = sample(prior_parameter_space, train_samples, key_i)
-y_prior_full = vmap(full_solution, in_axes=tree_map(lambda x: 0, X_prior_full))(*X_prior_full)
+with jax.default_device(cpu_device):
+    X_prior_full = sample(prior_train_space, train_samples, key_i)
+    y_prior_full = vmap(full_solution, in_axes=tree_map(lambda x: 0, X_prior_full))(*X_prior_full)
 
 surrogate_prior_full = make_surrogate(
     X_prior_full,
     y_prior_full,
     y_min=y_min_full,
-    y_max=y_max_full
+    y_max=y_max_full,
+    dropout_rate=.2,
+    batch_norm=False
 )
 key_i, key = random.split(key)
-params_prior_full = train_surrogate(
+variables = pytree_init(key_i, surrogate_prior_full, _freeze_attr(X_prior_full))
+prior_full_state = train_surrogate(
     X_prior_full,
     y_prior_full,
     surrogate_prior_full,
     mse,
-    key_i
+    key_i,
+    variables,
+    epochs=1000
 )
 ```
 
@@ -433,7 +534,11 @@ from flax.linen.module import _freeze_attr
 # Write function for validation set generation
 def full_solution_surrogate(surrogate, surrogate_params, params, eir, eta):
     surrogate_input = _freeze_attr([params, eir, eta])
-    return surrogate.apply(surrogate_params, surrogate_input)
+    return surrogate.apply(
+        {'params': surrogate_params.params, 'batch_stats': surrogate_params.batch_stats},
+        x=surrogate_input,
+        training=False
+    )
 
 def fixed_surrogate(surrogate, surrogate_params, params):
     surrogate_input = _freeze_attr([params])
@@ -493,11 +598,12 @@ def get_sensitivity(impl):
             'gradient': sensitivity[0][parameter]
         })
         for parameter in sensitivity[0].keys()
+        if parameter != 'EIR'
     ])
 ```
 
 ```{code-cell} ipython3
-sensitivity_prior_full = get_sensitivity(surrogate_impl_full(surrogate_prior_full, params_prior_full))
+sensitivity_prior_full = get_sensitivity(surrogate_impl_full(surrogate_prior_full, prior_full_state))
 ```
 
 ```{code-cell} ipython3
@@ -510,7 +616,8 @@ sensitivity_lhs_full = get_sensitivity(surrogate_impl_full(surrogate_lhs_full, p
 ```
 
 ```{code-cell} ipython3
-sensitivity_underlying = get_sensitivity(lambda p, e, a: prev_stats_multisite(p, e, a, full_solution))
+with jax.default_device(cpu_device):
+    sensitivity_underlying = get_sensitivity(lambda p, e, a: prev_stats_multisite(p, e, a, full_solution))
 ```
 
 ```{code-cell} ipython3
@@ -523,9 +630,9 @@ sns.barplot(
     pd.concat([
         sensitivity_underlying.assign(model='underlying'),
         sensitivity_prior_full.assign(model='prior_full'),
-        sensitivity_lhs_full.assign(model='lhs_full'),
-        sensitivity_prior_full.assign(model='prior_fixed'),
-        sensitivity_lhs_full.assign(model='lhs_fixed')
+        #sensitivity_lhs_full.assign(model='lhs_full'),
+        #sensitivity_prior_fixed.assign(model='prior_fixed'),
+        #sensitivity_lhs_fixed.assign(model='lhs_fixed')
     ]),
     x='parameter',
     y='gradient',
@@ -559,7 +666,7 @@ true_curves = get_curves(without_obs(true_values), EIRs, etas)
 ```
 
 ```{code-cell} ipython3
-lhs_full_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: full_solution_surrogate(surrogate_lhs_full, params_lhs_full, sort_dict(p), e, a))
+prior_full_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: full_solution_surrogate(surrogate_prior_full, prior_full_state, sort_dict(p), e, a))
 ```
 
 ```{code-cell} ipython3
@@ -590,13 +697,13 @@ for i in range(len(EIRs)):
     )
     axs[0, i].xaxis.set_label_position('top')
     for imm_i, imm in enumerate(imm_labels):
-        axs[imm_i, i].plot(lhs_full_prior_curves[imm][i, :n_curves, :].T, color='r', alpha=.01)
+        axs[imm_i, i].plot(prior_full_prior_curves[imm][i, :n_curves, :].T, color='r', alpha=.01)
         axs[imm_i, i].plot(true_curves[imm][i, 0, :])
         axs[imm_i, 0].set_ylabel(imm)
         
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
-fig.text(0.5, 1, 'LHS full prior immunity probability function', ha='center')
+fig.text(0.5, 1, 'Prior full prior immunity probability function', ha='center')
 ```
 
 ```{code-cell} ipython3
@@ -609,8 +716,8 @@ for i in range(len(EIRs)):
             f'EIR: {EIRs[i]}'
         )
         axs[0, i].xaxis.set_label_position('top')
-        axs[prev_i, i].plot(prior_curves[prev][i, :n_curves, :].T, color='r', alpha=.01)
-        axs[prev_i, i].plot(true_curves[prev][i, 0, :])
+        axs[prev_i, i].plot(prior_curves[prev][i, :n_curves, :].T / prior_curves['prop'][i, :n_curves, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(true_curves[prev][i, 0, :] / true_curves['prop'][i, 0, :].T)
         axs[prev_i, 0].set_ylabel(prev)
         #axs[prev_i, 0].set_yscale('log')
         
@@ -629,14 +736,14 @@ for i in range(len(EIRs)):
             f'EIR: {EIRs[i]}'
         )
         axs[0, i].xaxis.set_label_position('top')
-        axs[prev_i, i].plot(lhs_full_prior_curves[prev][i, :n_curves, :].T, color='r', alpha=.01)
-        axs[prev_i, i].plot(true_curves[prev][i, 0, :])
+        axs[prev_i, i].plot(prior_full_prior_curves[prev][i, :n_curves, :].T / prior_full_prior_curves['prop'][i, :n_curves, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(true_curves[prev][i, 0, :] / true_curves['prop'][i, 0, :].T)
         axs[prev_i, 0].set_ylabel(prev)
         #axs[prev_i, 0].set_yscale('log')
         
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
-fig.text(0.5, 1, 'LHS full prior pos_M/inc function', ha='center')
+fig.text(0.5, 1, 'Prior full prior pos_M/inc function', ha='center')
 ```
 
 ```{code-cell} ipython3
@@ -680,11 +787,17 @@ y_post_lhs_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, par
 ```
 
 ```{code-cell} ipython3
-prior_full_mcmc = surrogate_posterior_full(surrogate_prior_full, params_prior_full, key)
+prior_full_mcmc = surrogate_posterior_full(surrogate_prior_full, prior_full_state, key)
 X_post_prior_full = prior_full_mcmc.get_samples()
 y_post_prior_full = prev_stats_batch(X_post_prior_full)
-y_post_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, params_prior_full, X_post_prior_full)
+y_post_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, prior_full_state, X_post_prior_full)
+```
 
+```{code-cell} ipython3
+y_post_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, prior_full_state, {k: v for k, v in X_post_prior_full.items() if k != 'EIR'})
+```
+
+```{code-cell} ipython3
 prior_fixed_mcmc = surrogate_posterior_fixed(surrogate_prior_fixed, params_prior_fixed, key)
 X_post_prior_fixed = prior_fixed_mcmc.get_samples()
 y_post_prior_fixed = prev_stats_batch(X_post_prior_fixed)
@@ -694,6 +807,9 @@ y_post_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fixed,
 ```{code-cell} ipython3
 val_size = int(1e4)
 y_val_prior = prev_stats_batch(without_obs(prior))
+```
+
+```{code-cell} ipython3
 y_val_prior_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, sort_dict(without_obs(prior)))
 y_val_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed, sort_dict(without_obs(prior)))
 
@@ -705,7 +821,10 @@ y_val_lhs_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, para
 ```
 
 ```{code-cell} ipython3
-y_val_prior_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, params_prior_full, sort_dict(without_obs(prior)))
+y_val_prior_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, prior_full_state, sort_dict(without_obs(prior)))
+```
+
+```{code-cell} ipython3
 y_val_prior_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fixed, params_prior_fixed, sort_dict(without_obs(prior)))
 
 y_val_lhs_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, params_prior_full, X_val_lhs)
@@ -714,7 +833,7 @@ y_val_lhs_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fix
 
 ```{code-cell} ipython3
 def plot_predictive_error(y, y_hat):
-    fig, axs = plt.subplots(5, len(EIRs), figsize=(10, 8))
+    fig, axs = plt.subplots(5, len(EIRs), figsize=(50, 40))
     y_labels = ['prev2-10', 'prev10+', 'inc0-5', 'inc5-15', 'inc15+']
     y = jnp.concatenate(y, axis=2)
     y_hat = jnp.concatenate(y_hat, axis=2)
@@ -744,7 +863,8 @@ def plot_predictive_error(y, y_hat):
 ```
 
 ```{code-cell} ipython3
-plot_predictive_error(y_val_lhs, y_val_lhs_full_hat)
+plot_predictive_error(y_val_prior, y_val_prior_prior_full_hat)
+#plt.savefig('pe.png')
 ```
 
 ```{code-cell} ipython3
@@ -790,15 +910,31 @@ print(approximation_error(
 ```
 
 ```{code-cell} ipython3
+jnp.mean(jnp.abs(jnp.concatenate(y_val_prior, axis=2) - jnp.concatenate(y_val_prior_prior_full_hat, axis=2)) / jnp.concatenate(y_val_prior, axis=2))
+```
+
+```{code-cell} ipython3
+jnp.mean(jnp.abs(jnp.concatenate(y_post_prior_full, axis=2) - jnp.concatenate(y_post_prior_full_hat, axis=2)) / jnp.concatenate(y_post_prior_full, axis=2))
+```
+
+```{code-cell} ipython3
+approximation_error(
+    ['prior_full'],
+    ['prior'],
+    [y_val_prior],
+    [y_val_prior_prior_full_hat]
+).groupby(['output', 'EIR']).agg({'RE': 'mean', 'L1': 'mean'})
+```
+
+```{code-cell} ipython3
 n_samples = 100
 n_warmup = 100
-
 mcmc = MCMC(
     NUTS(model),
     num_samples=n_samples,
     num_warmup=n_warmup,
     num_chains=n_chains,
-    chain_method='parallel'
+    chain_method='vectorized'
 )
 mcmc.run(key, obs_prev, obs_inc)
 mcmc.print_summary(prob=0.7)
@@ -813,10 +949,10 @@ posterior_predictive = Predictive(
 ```
 
 ```{code-cell} ipython3
-prior_fixed_samples = prior_fixed_mcmc.get_samples()
-prior_fixed_predictive = Predictive(
+prior_full_samples = prior_full_mcmc.get_samples()
+prior_full_predictive = Predictive(
     model,
-    prior_fixed_samples
+    prior_full_samples
 )(key, obs_prev, obs_inc)
 ```
 
@@ -841,11 +977,12 @@ ks_data = pd.DataFrame([
     }
     for k in sample_keys
     for name, posterior in [
-        ('prior_fixed', prior_fixed_mcmc.get_samples()),
+        #('prior_fixed', prior_fixed_mcmc.get_samples()),
         ('prior_full', prior_full_mcmc.get_samples()),
-        ('lhs_fixed', lhs_fixed_mcmc.get_samples()),
-        ('lhs_full', lhs_full_mcmc.get_samples())
+        #('lhs_fixed', lhs_fixed_mcmc.get_samples()),
+        #('lhs_full', lhs_full_mcmc.get_samples())
     ]
+    if k != 'EIR'
 ])
 ```
 
@@ -930,9 +1067,9 @@ pyro_data = az.from_numpyro(
     posterior_predictive=posterior_predictive
 )
 pyro_data_surrogate = az.from_numpyro(
-    lhs_fixed_mcmc,
+    prior_full_mcmc,
     prior=prior,
-    posterior_predictive=lhs_fixed_predictive
+    posterior_predictive=prior_full_predictive
 )
 ```
 
@@ -945,13 +1082,14 @@ axs = az.plot_dist_comparison(
     ax=axs
 )
 for i in range(axs.shape[0]):
-    axs[i, 2].vlines(
-        true_values[keys[i]][0],
-        0,
-        axs[i, 2].get_ylim()[1],
-        color = 'red',
-        linestyle = 'dashed'
-    )
+    
+    #axs[i, 2].vlines(
+    #    true_values[keys[i]][0],
+    #    0,
+    #    axs[i, 2].get_ylim()[1],
+    #    color = 'red',
+    #    linestyle = 'dashed'
+    #)
     s_prior_lines = [axs[i, 0].get_lines()[1], axs[i, 2].get_lines()[2]]
     s_posterior_lines = [axs[i, 1].get_lines()[1], axs[i, 2].get_lines()[3]]
     for s_prior_line in s_prior_lines:
@@ -966,7 +1104,7 @@ for i in range(axs.shape[0]):
 ```
 
 ```{code-cell} ipython3
-posterior_curves_surrogate = get_curves(lhs_fixed_samples, EIRs, etas)
+posterior_curves_surrogate = get_curves(prior_full_samples, EIRs, etas)
 ```
 
 ```{code-cell} ipython3
@@ -995,11 +1133,15 @@ for i in range(len(EIRs)):
     for prev_i, prev in enumerate(prev_labels):
         axs[0, i].set_xlabel(f'EIR: {EIRs[i]}')
         axs[0, i].xaxis.set_label_position('top')
-        axs[prev_i, i].plot(posterior_curves_surrogate[prev][i, :, :].T, color='r', alpha=.01)
-        axs[prev_i, i].plot(true_curves[prev][i, 0, :])
+        axs[prev_i, i].plot(posterior_curves_surrogate[prev][i, :, :].T / posterior_curves_surrogate['prop'][i, :, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(true_curves[prev][i, 0, :] / true_curves['prop'][i, 0, :])
         axs[prev_i, 0].set_ylabel(prev)
         
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
 fig.text(0.5, 1, 'Surrogate posterior pos_M/inc function', ha='center')
+```
+
+```{code-cell} ipython3
+
 ```
