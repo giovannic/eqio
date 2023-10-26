@@ -15,13 +15,9 @@ kernelspec:
 # TODO
 
  * calculate approximation error
- * reduce dropout
- * remove batch_norm
  * inductive bias
- * remove standardisation?
- * more samples
  * remove immunity outputs?
- * weight by the likelihood?
+ * site distribution
 
 ```{code-cell} ipython3
 cpu_count = 100
@@ -105,7 +101,7 @@ prev_stats_multisite = vmap(
 ```
 
 ```{code-cell} ipython3
-EIRs = jnp.array([0.05, .5, .1, 1., 3.9, 15., 20., 100., 150., 418.])
+EIRs = jnp.array([0.05, 3.9, 15., 20., 100., 150., 418.])
 n_sites = EIRs.shape[0]
 key, key_i = random.split(key)
 etas = 1. / random.uniform(key_i, shape=(n_sites,), minval=40*365, maxval=100*365, dtype=jnp.float64)
@@ -120,13 +116,12 @@ class SiteDistribution(dist.Distribution):
 
     def __init__(self, sites, eir_std, validate_args=False):
         self.sites = sites
-        self.EIR_dist = dist.TruncatedDistribution(dist.Normal(loc=sites['EIR'], std=eir_std), 0., 1000.)
+        self.EIR_dist = dist.TruncatedNormal(sites['EIR'], eir_std, low=0., high=500.)
 
     def sample(self, key, sample_shape=()):
-        assert is_prng_key(key)
         key_index, key_normal = random.split(key)
-        index = random.choice(key_index, sample_shape, len(self.sites['EIR']))
-        EIRs = self.EIR_dist.sample(sample_shape)[index]
+        index = random.choice(key_index, n_sites, sample_shape)
+        EIRs = jnp.choose(index, self.EIR_dist.sample(key_normal, sample_shape).T)
         sites = tree_map(lambda leaf: leaf[index], self.sites)
         sites['EIR'] = EIRs
         return sites
@@ -148,25 +143,28 @@ class SiteDistribution(dist.Distribution):
 
 ```{code-cell} ipython3
 # TODO: take this from the model
+noise = 10.
+est_EIR = dist.TruncatedNormal(EIRs, noise, low=0., high=500.).sample(key)
+
 prior_train_space = [
     {
-        'kb': DistStrategy(dist.LogNormal(0., 1.)),
+        'kb': DistStrategy(dist.LogNormal(0., .1)),
         'ub': DistStrategy(dist.LogNormal(0., 1.)),
-        'b0': DistStrategy(dist.Beta(1., 1.)),
-        'IB0': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(50., 10.), low=0.)),
-        'kc': DistStrategy(dist.LogNormal(0., 1.)),
+        'b0': DistStrategy(dist.Beta(5., 1.)),
+        'IB0': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(100., 10.), low=0.)),
+        'kc': DistStrategy(dist.LogNormal(0., .1)),
         'uc': DistStrategy(dist.LogNormal(0., 1.)),
         'IC0': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(100., 10.), low=0.)),
         'phi0': DistStrategy(dist.Beta(5., 1.)),
         'phi1': DistStrategy(dist.Beta(1., 2.)),
         'PM': DistStrategy(dist.Beta(1., 1.)),
         'dm': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(200., 10.), low=0.)),
-        'kd': DistStrategy(dist.LogNormal(0., 1.)),
+        'kd': DistStrategy(dist.LogNormal(0., .1)),
         'ud': DistStrategy(dist.LogNormal(0., 1.)),
         'd1': DistStrategy(dist.Beta(1., 2.)),
         'ID0': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(25., 1.), low=0.)),
         'fd0': DistStrategy(dist.Beta(1., 1.)),
-        'gd': DistStrategy(dist.LogNormal(0., 1.)),
+        'gd': DistStrategy(dist.LogNormal(0., .1)),
         'ad0': DistStrategy(dist.TruncatedDistribution(
             dist.Cauchy(70. * 365., 365.),
             low=40. * 365.,
@@ -174,20 +172,9 @@ prior_train_space = [
         )),
         'rU': DistStrategy(dist.LogNormal(0., 1.))
     },
-    DistStrategy( #Sample using SiteDistribution
-        dist.MixtureSameFamily(
-            dist.Categorical(jnp.full(EIRs.shape, 1 / len(EIRs))),
-            dist.TruncatedDistribution(dist.Normal(EIRs, 10.), 0., 1000.)
-        )
-    ),
-    DistStrategy(
-        dist.MixtureSameFamily(
-            dist.Categorical(jnp.full(etas.shape, 1 / len(etas))),
-            dist.TruncatedDistribution(dist.Normal(etas, 1e-5), 1e-6, 1e-4)
-        )
-    )
-    #DistStrategy(dist.Uniform(0., 500.)), # EIR
-    #DistStrategy(dist.Uniform(1/(100 * 365), 1/(40 * 365))) # eta
+    DistStrategy(SiteDistribution({'EIR': est_EIR, 'etas': etas}, noise))
+    #DistStrategy(dist.Uniform(jnp.zeros((n_sites,)), jnp.full((n_sites,), 500.))), # EIR
+    #DistStrategy(dist.Uniform(jnp.full((n_sites,), 1/(100 * 365)), jnp.full((n_sites,), 1/(40 * 365)))) # eta
 ]
 
 prior_test_space = [
@@ -222,18 +209,18 @@ prior_test_space = [
 ```
 
 ```{code-cell} ipython3
-def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
+def model(true_EIR=None, prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
     with numpyro.plate('sites', n_sites):
-        EIR = numpyro.sample('EIR', dist.Uniform(0., 500.))
+        EIR = numpyro.sample('EIR', dist.Uniform(0., 500.), obs=true_EIR)
     
     # Pre-erythrocytic immunity
-    kb = numpyro.sample('kb', dist.LogNormal(0., 1.))
+    kb = numpyro.sample('kb', dist.LogNormal(0., .1))
     ub = numpyro.sample('ub', dist.LogNormal(0., 1.))
-    b0 = numpyro.sample('b0', dist.Beta(1., 1.))
-    IB0 = numpyro.sample('IB0', dist.LeftTruncatedDistribution(dist.Cauchy(50., 10.), low=0.))
+    b0 = numpyro.sample('b0', dist.Beta(5., 1.))
+    IB0 = numpyro.sample('IB0', dist.LeftTruncatedDistribution(dist.Cauchy(100., 10.), low=0.))
     
     # Clinical immunity
-    kc = numpyro.sample('kc', dist.LogNormal(0., 1.))
+    kc = numpyro.sample('kc', dist.LogNormal(0., .1))
     uc = numpyro.sample('uc', dist.LogNormal(0., 1.))
     phi0 = numpyro.sample('phi0', dist.Beta(5., 1.))
     phi1 = numpyro.sample('phi1', dist.Beta(1., 2.))
@@ -242,12 +229,12 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
     dm = numpyro.sample('dm', dist.LeftTruncatedDistribution(dist.Cauchy(200., 10.), low=0.))
     
     # Detection immunity
-    kd = numpyro.sample('kd', dist.LogNormal(0., 1.))
+    kd = numpyro.sample('kd', dist.LogNormal(0., .1))
     ud = numpyro.sample('ud', dist.LogNormal(0., 1.))
     d1 = numpyro.sample('d1', dist.Beta(1., 2.))
     ID0 = numpyro.sample('ID0', dist.LeftTruncatedDistribution(dist.Cauchy(25., 1.), low=0.))
     fd0 = numpyro.sample('fd0', dist.Beta(1., 1.))
-    gd = numpyro.sample('gd', dist.LogNormal(0., 1.))
+    gd = numpyro.sample('gd', dist.LogNormal(0., .1))
     ad0 = numpyro.sample('ad0', dist.TruncatedDistribution(
             dist.Cauchy(70. * 365., 365.),
             low=40. * 365.,
@@ -284,8 +271,8 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
     numpyro.sample(
         'obs_prev',
         dist.Independent(
-            dist.Binomial(total_count=prev_N, probs=prev_stats.reshape(-1), validate_args=True),
-            1
+            dist.Binomial(total_count=prev_N, probs=prev_stats, validate_args=True),
+            2
         ),
         obs=prev
     )
@@ -293,8 +280,8 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
     numpyro.sample(
         'obs_inc',
         dist.Independent(
-            dist.Poisson(rate=jnp.maximum(inc_stats.reshape(-1) * person_risk_time, 1e-12)),
-            1
+            dist.Poisson(rate=jnp.maximum(inc_stats * person_risk_time, 1e-12)),
+            2
         ),
         obs=inc
     )
@@ -302,7 +289,7 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
 
 ```{code-cell} ipython3
 key, key_i = random.split(key)
-true_values = Predictive(model, num_samples=1)(key_i)
+true_values = Predictive(model, num_samples=1)(key_i, true_EIR=EIRs)
 ```
 
 ```{code-cell} ipython3
@@ -458,8 +445,11 @@ from flax.linen.module import _freeze_attr
 key_i, key = random.split(key)
 with jax.default_device(cpu_device):
     X_prior_full = sample(prior_train_space, train_samples, key_i)
+    X_prior_full = [X_prior_full[0], X_prior_full[1]['EIR'], X_prior_full[1]['etas']]
     y_prior_full = vmap(full_solution, in_axes=tree_map(lambda x: 0, X_prior_full))(*X_prior_full)
+```
 
+```{code-cell} ipython3
 surrogate_prior_full = make_surrogate(
     X_prior_full,
     y_prior_full,
@@ -572,32 +562,33 @@ def prev_stats_batch(params):
 
 ```{code-cell} ipython3
 def surrogate_impl_full(surrogate, params):
-    return lambda p, e, a: prev_stats_multisite(p, e, a, lambda p_, e_, a_: full_solution_surrogate(surrogate, params, sort_dict(p_), e_, a_))
+    def clip(stats):
+        return tree_map(lambda x: jnp.minimum(x, 1.), stats)
+    return lambda p, e, a: clip(prev_stats_multisite(p, e, a, lambda p_, e_, a_: full_solution_surrogate(surrogate, params, sort_dict(p_), e_, a_)))
 
 def surrogate_impl_fixed(surrogate, params):
     return lambda p, e, a: fixed_surrogate(surrogate, params, sort_dict(p))
 ```
 
 ```{code-cell} ipython3
-from jax import jacfwd
 from numpyro.infer.util import log_density
 
 def densities(p, model, impl):
     ld = log_density(model, [], {'prev': obs_prev, 'inc': obs_inc, 'impl': impl}, p)
-    return (
-        ld[0],
-        ld[1]['obs_prev']['fn'].base_dist.log_prob(ld[1]['obs_prev']['value']).reshape((len(EIRs), 2)),
-        ld[1]['obs_inc']['fn'].base_dist.log_prob(ld[1]['obs_inc']['value']).reshape((len(EIRs), 3))
-    )
+    return ld[0]
+```
+
+```{code-cell} ipython3
+from jax import jacfwd
 
 def get_sensitivity(impl):
     sensitivity = vmap(jacfwd(densities), in_axes=[tree_map(lambda _: 0, without_obs(prior)), None, None])(without_obs(prior), model, impl)
     return pd.concat([
         pd.DataFrame({
             'parameter': parameter,
-            'gradient': sensitivity[0][parameter]
+            'gradient': sensitivity[parameter]
         })
-        for parameter in sensitivity[0].keys()
+        for parameter in sensitivity.keys()
         if parameter != 'EIR'
     ])
 ```
@@ -768,7 +759,7 @@ def surrogate_posterior(surrogate, params, key, impl):
         num_chains=n_chains,
         chain_method='vectorized' #pmap leads to segfault for some reason (https://github.com/google/jax/issues/13858)
     )
-    mcmc.run(key, obs_prev, obs_inc, impl)
+    mcmc.run(key, None, obs_prev, obs_inc, impl)
     return mcmc
 ```
 
@@ -790,10 +781,6 @@ y_post_lhs_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, par
 prior_full_mcmc = surrogate_posterior_full(surrogate_prior_full, prior_full_state, key)
 X_post_prior_full = prior_full_mcmc.get_samples()
 y_post_prior_full = prev_stats_batch(X_post_prior_full)
-y_post_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, prior_full_state, X_post_prior_full)
-```
-
-```{code-cell} ipython3
 y_post_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, prior_full_state, {k: v for k, v in X_post_prior_full.items() if k != 'EIR'})
 ```
 
@@ -936,7 +923,7 @@ mcmc = MCMC(
     num_chains=n_chains,
     chain_method='vectorized'
 )
-mcmc.run(key, obs_prev, obs_inc)
+mcmc.run(key, None, obs_prev, obs_inc)
 mcmc.print_summary(prob=0.7)
 ```
 
@@ -967,28 +954,50 @@ lhs_fixed_predictive = Predictive(
 ```{code-cell} ipython3
 from scipy.stats import ks_2samp
 sample_keys = list(posterior_samples.keys())
-ks_data = pd.DataFrame([
-    {
-        'experiment': name,
-        'variable': k,
-        'statistic': ks_2samp(posterior_samples[k], posterior[k]).statistic,
-        'p-value': ks_2samp(posterior_samples[k], posterior[k]).pvalue,
-        'mean': float(jnp.mean(posterior[k]))
-    }
-    for k in sample_keys
-    for name, posterior in [
-        #('prior_fixed', prior_fixed_mcmc.get_samples()),
-        ('prior_full', prior_full_mcmc.get_samples()),
-        #('lhs_fixed', lhs_fixed_mcmc.get_samples()),
-        #('lhs_full', lhs_full_mcmc.get_samples())
-    ]
-    if k != 'EIR'
+ks_data = pd.concat([
+    pd.DataFrame([
+        {
+            'experiment': name,
+            'variable': k,
+            'statistic': ks_2samp(posterior_samples[k], posterior[k]).statistic,
+            'p-value': ks_2samp(posterior_samples[k], posterior[k]).pvalue,
+            'mean': float(jnp.mean(posterior[k])),
+            'true_mean': float(jnp.mean(posterior_samples[k])),
+        }
+        for k in sample_keys
+        for name, posterior in [
+            #('prior_fixed', prior_fixed_mcmc.get_samples()),
+            ('prior_full', prior_full_mcmc.get_samples()),
+            #('lhs_fixed', lhs_fixed_mcmc.get_samples()),
+            #('lhs_full', lhs_full_mcmc.get_samples())
+        ]
+        if k != 'EIR'
+    ]),
+    pd.DataFrame([
+        {
+            'experiment': name,
+            'variable': f'EIR_{i}',
+            'statistic': ks_2samp(posterior_samples['EIR'][:,i], posterior['EIR'][:,i]).statistic,
+            'p-value': ks_2samp(posterior_samples['EIR'][:,i], posterior['EIR'][:,i]).pvalue,
+            'mean': float(jnp.mean(posterior['EIR'][:,i])),
+            'true_mean': float(jnp.mean(posterior_samples['EIR'][:,i]))
+        }
+        for name, posterior in [
+            #('prior_fixed', prior_fixed_mcmc.get_samples()),
+            ('prior_full', prior_full_mcmc.get_samples()),
+            #('lhs_fixed', lhs_fixed_mcmc.get_samples()),
+            #('lhs_full', lhs_full_mcmc.get_samples())
+        ]
+        for i in range(posterior['EIR'].shape[1])
+    ])
 ])
 ```
 
 ```{code-cell} ipython3
-ks_data.pivot(columns='experiment', index='variable').swaplevel(axis='columns').sort_index(axis=1, level=0).loc[[
-        # Pre-erythrocytic immunity
+ks_data.pivot(columns='experiment', index='variable').swaplevel(axis='columns').sort_index(axis=1, level=0).loc[
+[f'EIR_{i}' for i in range(n_sites)] +
+[
+    # Pre-erythrocytic immunity
     'kb',
     'ub',
     'b0',
@@ -1012,7 +1021,8 @@ ks_data.pivot(columns='experiment', index='variable').swaplevel(axis='columns').
     'gd',
     'ad0',
     'rU',
-]]
+]
+]
 ```
 
 ```{code-cell} ipython3

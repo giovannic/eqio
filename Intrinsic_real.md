@@ -41,8 +41,6 @@ import matplotlib.pyplot as plt
 import jax.numpy as jnp
 from jax import random, jit, vmap
 import jax
-
-jax.config.update('jax_platform_name', 'cpu') # for memory purposes
 ```
 
 ```{code-cell} ipython3
