@@ -14,10 +14,13 @@ kernelspec:
 
 # TODO
 
- * calculate approximation error
- * inductive bias
- * remove immunity outputs?
- * site distribution
+ * Properly sample truncated normal
+ * Implement in mox
+   * History matching many rounds
+   * History matching from sample
+ * Implement in fastms
+   * HM dmeq samples - battle data
+   * HM IBM samples from starting point
 
 ```{code-cell} ipython3
 cpu_count = 100
@@ -172,6 +175,7 @@ prior_train_space = [
         )),
         'rU': DistStrategy(dist.LogNormal(0., 1.))
     },
+    #DistStrategy(dist.TruncatedNormal(est_EIR, noise, low=0., high=500))
     DistStrategy(SiteDistribution({'EIR': est_EIR, 'etas': etas}, noise))
     #DistStrategy(dist.Uniform(jnp.zeros((n_sites,)), jnp.full((n_sites,), 500.))), # EIR
     #DistStrategy(dist.Uniform(jnp.full((n_sites,), 1/(100 * 365)), jnp.full((n_sites,), 1/(40 * 365)))) # eta
@@ -319,7 +323,7 @@ import jax
 import pandas as pd
 from scipy.stats.qmc import LatinHypercube
 
-train_samples = int(1e4)
+train_samples = int(1e5)
 device_count = len(jax.devices())
 ```
 
@@ -332,24 +336,24 @@ min_val = jnp.finfo(jnp.float32).smallest_normal
 # Create the X_lhs dataset
 intrinsic_bounds = pd.DataFrame.from_records([
     ('kb', 0, 10),
-    ('ub', 0, 10),
+    ('ub', 0, 100),
     ('b0', 0, 1),
-    ('IB0', 0, 100),
+    ('IB0', 0, 500),
     ('kc', 0, 10),
-    ('uc', 0, 10),
-    ('IC0', 0, 200),
+    ('uc', 0, 100),
+    ('IC0', 0, 500),
     ('phi0', 0, 1),
     ('phi1', 0, 1),
     ('PM', 0, 1),
-    ('dm', 0, 500),
+    ('dm', 0, 1000),
     ('kd', min_val, 10),
-    ('ud', 0, 10),
+    ('ud', 0, 100),
     ('d1', 0, 1),
     ('ID0', 0, 100),
     ('fd0', 0, 1),
     ('gd', 0, 10),
     ('ad0', 40 * 365, 100 * 365),
-    ('rU', 0, 1),
+    ('rU', 0, 10),
 ], columns=['name', 'lower', 'upper'])
 
 lhs_train_space = [
@@ -357,10 +361,11 @@ lhs_train_space = [
         name: LHSStrategy(lower, upper)
         for name, lower, upper in intrinsic_bounds.itertuples(index=False)
     },
+    DistStrategy(SiteDistribution({'EIR': est_EIR, 'etas': etas}, noise))
     #LHSStrategy(0., 500.),
     #LHSStrategy(1/(100 * 365), 1/(40 * 365))
-    LHSStrategy(jnp.full((n_sites,), 0.), jnp.full((n_sites,), 500.)),
-    LHSStrategy(jnp.full((n_sites,), 1/(100 * 365)), jnp.full((n_sites,), 1/(40 * 365)))
+    #LHSStrategy(jnp.full((n_sites,), 0.), jnp.full((n_sites,), 500.)),
+    #LHSStrategy(jnp.full((n_sites,), 1/(100 * 365)), jnp.full((n_sites,), 1/(40 * 365)))
 ]
 
 lhs_test_space = [
@@ -420,7 +425,18 @@ y_max_full = {
 key_i, key = random.split(key)
 with jax.default_device(cpu_device):
     X_lhs_full = sample(lhs_train_space, train_samples, key_i)
-    y_lhs_full = vmap(vmap(full_solution, in_axes=[None, 0, 0]), in_axes=tree_map(lambda _: 0, X_lhs_full))(*X_lhs_full)
+    X_lhs_full = [X_lhs_full[0], X_lhs_full[1]['EIR'], X_lhs_full[1]['etas']]
+    y_lhs_full = vmap(full_solution, in_axes=tree_map(lambda _: 0, X_lhs_full))(*X_lhs_full)
+```
+
+```{code-cell} ipython3
+from flax.linen.module import _freeze_attr
+key_i, key = random.split(key)
+with jax.default_device(cpu_device):
+    X_prior_full = sample(prior_train_space, train_samples, key_i)
+    #X_prior_full = [X_prior_full[0], X_prior_full[1]['EIR'], X_prior_full[1]['etas']]
+    X_prior_full = X_prior_full + [jnp.repeat(etas[None, :], train_samples, axis=0)]
+    y_prior_full = vmap(vmap(full_solution, in_axes=[None, 0, 0]), in_axes=tree_map(lambda x: 0, X_prior_full))(*X_prior_full)
 ```
 
 ```{code-cell} ipython3
@@ -435,8 +451,29 @@ def implausability(y_full):
 ```
 
 ```{code-cell} ipython3
+from flax.linen.module import _freeze_attr
+key_i, key = random.split(key)
+with jax.default_device(cpu_device):
+    X_prior_full = sample(prior_train_space, train_samples, key_i)
+    X_prior_full = [X_prior_full[0], X_prior_full[1]['EIR'], X_prior_full[1]['etas']]
+    y_prior_full = vmap(full_solution, in_axes=tree_map(lambda x: 0, X_prior_full))(*X_prior_full)
+```
+
+```{code-cell} ipython3
+z = jnp.concatenate([obs_prev, obs_inc], axis=2)
+
+def implausability(y_full):
+    y = prev_stats(y_full)
+    ex = jnp.concatenate([y[0] * prev_N, y[1] * person_risk_time])
+    var = jnp.concatenate([y[0] * (1 - y[0]) * prev_N, y[1]  * person_risk_time])
+    diff = jnp.abs(z - ex)
+    per_site = jnp.max(diff / jnp.sqrt(var), axis=2)
+    return jnp.min(per_site), jnp.argmin(per_site)
+```
+
+```{code-cell} ipython3
 def standardise(x, mu, sigma):
-    return tree_map(lambda l, m, s: (l - m) / s, x, mu, sigma), mu, sigma
+    return tree_map(lambda l, m, s: (l - m) / s, x, mu, sigma)
 
 def inverse_standardise(x, mu, sigma):
     return tree_map(lambda l, m, s: l * s + m, x, mu, sigma)
@@ -449,12 +486,26 @@ def limit(x, x_min, x_max):
         x_max
     )
     
-def perturb(key, x, x_mean, x_std):
-    x_stand = standardise(x)
+def perturb(key, x, x_mean, x_std, x_min, x_max):
+    x_stand = standardise(x, x_mean, x_std)
     x_peturbed = tree_map(lambda l: l + random.normal(key, shape=l.shape), x_stand)
     x_new = inverse_standardise(x_peturbed, x_mean, x_std)
     x_new = limit(x, x_min, x_max)
     return x_new
+
+#def perturb(key, x, x_mean, x_std, x_min, x_max):
+#    x_stand = standardise(x, x_mean, x_std)
+#    x_min_stand = standardise(x_min, x_mean, x_std)
+#    x_max_stand = standardise(x_max, x_mean, x_std)
+#    x_peturbed = tree_map(
+#        lambda l, lower, upper: l + random.truncated_normal(key, lower=lower - l, upper=upper - l, shape=l.shape),
+#        x_stand,
+#        x_min_stand,
+#        x_max_stand
+#    )
+#    x_new = inverse_standardise(x_peturbed, x_mean, x_std)
+    #x_new = limit(x, x_min, x_max)
+#    return x_new
 ```
 
 ```{code-cell} ipython3
@@ -463,47 +514,11 @@ def combine(x, y):
 ```
 
 ```{code-cell} ipython3
-y_full = tree_map(lambda y: y[0], y_lhs_full)
+ip, ip_site = vmap(implausability, in_axes=[tree_map(lambda _: 0, y_prior_full)])(y_prior_full)
 ```
 
 ```{code-cell} ipython3
-y = vmap(prev_stats, in_axes=[tree_map(lambda _: 0, y_full)])(y_full)
-```
-
-```{code-cell} ipython3
-ex = jnp.concatenate([y[0] * prev_N, y[1] * person_risk_time], axis=1).reshape(-1)
-```
-
-```{code-cell} ipython3
-print(ex)
-```
-
-```{code-cell} ipython3
-z
-```
-
-```{code-cell} ipython3
-var = jnp.concatenate([y[0] * (1 - y[0]) * prev_N, y[1]  * person_risk_time], axis=1).reshape(-1)
-```
-
-```{code-cell} ipython3
-print(var)
-```
-
-```{code-cell} ipython3
-diff = jnp.abs(z - ex)
-```
-
-```{code-cell} ipython3
-diff
-```
-
-```{code-cell} ipython3
-diff / jnp.sqrt(var)
-```
-
-```{code-cell} ipython3
-ip = vmap(implausability, in_axes=[tree_map(lambda _: 0, y_lhs_full)])(y_lhs_full)
+ip, ip_site = vmap(implausability, in_axes=[tree_map(lambda _: 0, y_lhs_full)])(y_lhs_full)
 ```
 
 ```{code-cell} ipython3
@@ -511,7 +526,48 @@ plt.hist(ip, bins=100)
 ```
 
 ```{code-cell} ipython3
-jnp.min(ip)
+from collections import Counter
+```
+
+```{code-cell} ipython3
+Counter([int(i) for i in ip_site[ip < cutoff]])
+```
+
+```{code-cell} ipython3
+n_rounds = 5
+X_hm = X_prior_full.copy()
+y_hm = y_prior_full.copy()
+X_mean = tree_map(jnp.mean, X_hm)
+X_std = tree_map(jnp.std, X_hm)
+cutoff = 3
+for i in range(n_rounds):
+    print(f'round {i}')
+    ip, ip_site = vmap(implausability, in_axes=[tree_map(lambda _: 0, y_hm)])(y_hm)
+        
+    take = ip < cutoff
+    print(jnp.sum(ip < cutoff))
+    counter = Counter([int(i) for i in ip_site[ip < cutoff]])
+    print(counter)
+
+    if i < n_rounds:
+        with jax.default_device(cpu_device):
+            key_i, key = random.split(key)
+            next_index = random.choice(
+                key_i,
+                jnp.sum(take),
+                (train_samples,),
+                p=1/jnp.array([counter[int(i)] for i in ip_site[take]])
+            )
+            X_next = tree_map(lambda l: l[take][next_index], X_hm)
+            next_etas = X_next[-1]
+            X_next = perturb(key_i, X_next[:-1], X_mean[:-1], X_std[:-1], x_min[:-1], x_max[:-1]) + [next_etas]
+            y_next = vmap(full_solution, in_axes=tree_map(lambda _: 0, X_next))(*X_next)
+            X_hm = combine(X_hm, X_next)
+            y_hm = combine(y_hm, y_next)
+```
+
+```{code-cell} ipython3
+tree_map(lambda x, y: jnp.sum(x == y), X_hm, x_max)
 ```
 
 ```{code-cell} ipython3
@@ -555,36 +611,33 @@ def prev_stats_batch(params):
 ```
 
 ```{code-cell} ipython3
-sum(ip < 3)
+surrogate_hm = make_surrogate(
+    X_hm,
+    y_hm,
+    y_min=y_min_full,
+    y_max=y_max_full,
+    dropout_rate=.2,
+    batch_norm=False
+)
+key_i, key = random.split(key)
+variables = pytree_init(key_i, surrogate_hm, _freeze_attr(X_hm))
+hm_state = train_surrogate(
+    X_hm,
+    y_hm,
+    surrogate_hm,
+    mse,
+    key_i,
+    variables,
+    epochs=1000
+)
 ```
 
 ```{code-cell} ipython3
-jnp.min(ip)
-```
+def surrogate_impl_full(surrogate, params):
+    return lambda p, e, a: prev_stats_multisite(p, e, a, lambda p_, e_, a_: full_solution_surrogate(surrogate, params, sort_dict(p_), e_, a_))
 
-```{code-cell} ipython3
-tree_map(lambda x: x.shape, y_lhs_full)
-```
-
-```{code-cell} ipython3
-n_rounds = 5
-X_mean = tree_map(jnp.mean, X_lhs_full)
-X_std = tree_map(jnp.std, X_lhs_full)
-cutoff = 3
-for i in range(n_rounds):
-    print(f'round {i}')
-    ip = vmap(implausability, in_axes=[tree_map(lambda _: 0, y_lhs_full), None])(y_lhs_full)
-        
-    take = ip < cutoff
-    
-    with jax.default_device(cpu_device):
-        next_index = random.choice(key, jnp.sum(take), (train_samples,))
-        X_next = tree_map(lambda l: l[take][next_index], X_lhs_full)
-        key_i, key = random.split(key)
-        X_next = perturb(key_i, X_next)
-        y_next = vmap(vmap(full_solution, in_axes=[None, 0, 0]), in_axes=[tree_map(lambda _: 0, X_next), 0, 0])(*X_next)
-        X_lhs_full = combine(X_lhs_full, X_next)
-        y_lhs_full = combine(y_lhs_full, y_next)
+def surrogate_impl_fixed(surrogate, params):
+    return lambda p, e, a: fixed_surrogate(surrogate, params, sort_dict(p))
 ```
 
 ```{code-cell} ipython3
@@ -666,15 +719,7 @@ true_curves = get_curves(without_obs(true_values), EIRs, etas)
 ```
 
 ```{code-cell} ipython3
-prior_full_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: full_solution_surrogate(surrogate_prior_full, prior_full_state, sort_dict(p), e, a))
-```
-
-```{code-cell} ipython3
-comb_full_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: full_solution_surrogate(surrogate_comb_full, comb_full_state, sort_dict(p), e, a))
-```
-
-```{code-cell} ipython3
-lhs_full_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: full_solution_surrogate(surrogate_lhs_full, lhs_full_state, sort_dict(p), e, a))
+hm_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: full_solution_surrogate(surrogate_hm, hm_state, sort_dict(p), e, a))
 ```
 
 ```{code-cell} ipython3
@@ -708,7 +753,7 @@ for i in range(len(EIRs)):
     )
     axs[0, i].xaxis.set_label_position('top')
     for imm_i, imm in enumerate(imm_labels):
-        axs[imm_i, i].plot(lhs_full_prior_curves[imm][i, :n_curves, :].T, color='r', alpha=.01)
+        axs[imm_i, i].plot(hm_prior_curves[imm][i, :n_curves, :].T, color='r', alpha=.01)
         axs[imm_i, i].plot(true_curves[imm][i, 0, :])
         axs[imm_i, 0].set_ylabel(imm)
         
@@ -747,7 +792,7 @@ for i in range(len(EIRs)):
             f'EIR: {EIRs[i]}'
         )
         axs[0, i].xaxis.set_label_position('top')
-        axs[prev_i, i].plot(lhs_full_prior_curves[prev][i, :n_curves, :].T / lhs_full_prior_curves['prop'][i, :n_curves, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(hm_prior_curves[prev][i, :n_curves, :].T / hm_prior_curves['prop'][i, :n_curves, :].T, color='r', alpha=.01)
         axs[prev_i, i].plot(true_curves[prev][i, 0, :] / true_curves['prop'][i, 0, :].T)
         axs[prev_i, 0].set_ylabel(prev)
         #axs[prev_i, 0].set_yscale('log')
@@ -784,10 +829,10 @@ def surrogate_posterior(surrogate, params, key, impl):
 ```
 
 ```{code-cell} ipython3
-lhs_full_mcmc = surrogate_posterior_full(surrogate_lhs_full, lhs_full_state, key)
-X_post_lhs_full = lhs_full_mcmc.get_samples()
-y_post_lhs_full = prev_stats_batch(X_post_lhs_full)
-y_post_lhs_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, lhs_full_state, {k: v for k, v in X_post_lhs_full.items() if k != 'EIR'})
+hm_mcmc = surrogate_posterior_full(surrogate_hm, hm_state, key)
+X_post_hm = hm_mcmc.get_samples()
+y_post_hm = prev_stats_batch(X_post_hm)
+y_post_hm_hat = prev_stats_surrogate_batch(surrogate_hm, hm_state, {k: v for k, v in X_post_hm.items() if k != 'EIR'})
 ```
 
 ```{code-cell} ipython3
@@ -844,6 +889,10 @@ y_val_prior_comb_full_hat = prev_stats_surrogate_batch(surrogate_comb_full, comb
 
 ```{code-cell} ipython3
 y_val_prior_lhs_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, lhs_full_state, sort_dict(without_obs(prior)))
+```
+
+```{code-cell} ipython3
+y_val_hm_hat = prev_stats_surrogate_batch(surrogate_hm, hm_state, sort_dict(without_obs(prior)))
 ```
 
 ```{code-cell} ipython3
@@ -931,7 +980,7 @@ print(approximation_error(
 ```
 
 ```{code-cell} ipython3
-jnp.mean(jnp.abs(jnp.concatenate(y_val_prior, axis=2) - jnp.concatenate(y_val_prior_comb_full_hat, axis=2)) / jnp.concatenate(y_val_prior, axis=2))
+jnp.mean(jnp.abs(jnp.concatenate(y_val_prior, axis=2) - jnp.concatenate(y_val_hm_hat, axis=2)) / jnp.concatenate(y_val_prior, axis=2))
 ```
 
 ```{code-cell} ipython3
@@ -939,7 +988,7 @@ jnp.mean(jnp.abs(jnp.concatenate(y_val_prior, axis=2) - jnp.concatenate(y_val_pr
 ```
 
 ```{code-cell} ipython3
-jnp.mean(jnp.abs(jnp.concatenate(y_post_comb_full, axis=2) - jnp.concatenate(y_post_comb_full_hat, axis=2)) / jnp.concatenate(y_post_comb_full, axis=2))
+jnp.mean(jnp.abs(jnp.concatenate(y_post_hm, axis=2) - jnp.concatenate(y_post_hm_hat, axis=2)) / jnp.concatenate(y_post_hm, axis=2))
 ```
 
 ```{code-cell} ipython3
@@ -960,16 +1009,26 @@ approximation_error(
 ```
 
 ```{code-cell} ipython3
-n_samples = 100
-n_warmup = 100
-mcmc = MCMC(
-    NUTS(model),
-    num_samples=n_samples,
-    num_warmup=n_warmup,
-    num_chains=n_chains,
-    chain_method='vectorized'
-)
-mcmc.run(key, None, obs_prev, obs_inc)
+import pickle
+import os.path
+
+if os.path.isfile("mcmc.pkl"):
+    with open("mcmc.pkl", "rb") as g:
+        mcmc = pickle.load(g)
+else:
+    n_samples = 100
+    n_warmup = 100
+    mcmc = MCMC(
+        NUTS(model),
+        num_samples=n_samples,
+        num_warmup=n_warmup,
+        num_chains=n_chains,
+        chain_method='vectorized'
+    )
+    mcmc.run(key, None, obs_prev, obs_inc)
+    with open("mcmc.pkl", "wb") as f:
+        pickle.dump(mcmc, f)
+
 mcmc.print_summary(prob=0.7)
 ```
 
@@ -998,10 +1057,10 @@ prior_full_predictive = Predictive(
 ```
 
 ```{code-cell} ipython3
-lhs_fixed_samples = lhs_fixed_mcmc.get_samples()
-lhs_fixed_predictive = Predictive(
+hm_samples = hm_mcmc.get_samples()
+hm_predictive = Predictive(
     model,
-    lhs_fixed_samples
+    hm_samples
 )(key, obs_prev, obs_inc)
 ```
 
@@ -1024,7 +1083,8 @@ ks_data = pd.concat([
             #('prior_full', prior_full_mcmc.get_samples()),
             #('lhs_fixed', lhs_fixed_mcmc.get_samples()),
             #('lhs_full', lhs_full_mcmc.get_samples()),
-            ('comb_full', comb_full_mcmc.get_samples())
+            #('comb_full', comb_full_mcmc.get_samples())
+            ('hm', hm_mcmc.get_samples())
         ]
         if k != 'EIR'
     ]),
@@ -1043,7 +1103,8 @@ ks_data = pd.concat([
             #('comb_full', comb_full_mcmc.get_samples())
             #('lhs_fixed', lhs_fixed_mcmc.get_samples()),
             #('lhs_full', lhs_full_mcmc.get_samples())
-            ('comb_full', comb_full_mcmc.get_samples())
+            #('comb_full', comb_full_mcmc.get_samples()),
+            ('hm', hm_mcmc.get_samples())
         ]
         for i in range(posterior['EIR'].shape[1])
     ])
@@ -1134,9 +1195,9 @@ pyro_data = az.from_numpyro(
     posterior_predictive=posterior_predictive
 )
 pyro_data_surrogate = az.from_numpyro(
-    prior_full_mcmc,
+    hm_mcmc,
     prior=prior,
-    posterior_predictive=comb_full_predictive
+    posterior_predictive=hm_predictive
 )
 ```
 
@@ -1184,7 +1245,7 @@ for i in range(axs.shape[0]):
 ```
 
 ```{code-cell} ipython3
-posterior_curves_surrogate = get_curves(prior_full_samples, EIRs, etas)
+posterior_curves_surrogate = get_curves(hm_samples, EIRs, etas)
 ```
 
 ```{code-cell} ipython3
@@ -1247,7 +1308,7 @@ def get_batch_imm_curves(params):
 ```
 
 ```{code-cell} ipython3
-posterior_imm_curves = get_batch_imm_curves(prior_full_samples)
+posterior_imm_curves = get_batch_imm_curves(hm_samples)
 true_imm_curves = get_batch_imm_curves(without_obs(true_values))
 ```
 
