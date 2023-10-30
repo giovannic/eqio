@@ -19,6 +19,10 @@ kernelspec:
  * remove immunity outputs?
  * site distribution
 
+# Insights
+
+ * longer chain convergence for surrogate
+
 ```{code-cell} ipython3
 cpu_count = 100
 import os
@@ -348,7 +352,7 @@ intrinsic_bounds = pd.DataFrame.from_records([
     ('ID0', 0, 100),
     ('fd0', 0, 1),
     ('gd', 0, 10),
-    ('ad0', 20 * 365, 40 * 365),
+    ('ad0', 40 * 365, 100 * 365),
     ('rU', 0, 1),
 ], columns=['name', 'lower', 'upper'])
 
@@ -379,12 +383,12 @@ lhs_test_space = [
 x_min = [{
     name: lower
     for name, lower, _ in intrinsic_bounds.itertuples(index=False)
-}, 0., 1/(40 * 365)]
+}, 0., 1/(100 * 365)]
 
 x_max = [{
     name: upper
     for name, _, upper in intrinsic_bounds.itertuples(index=False)
-}, 500., 1/(20 * 365)]
+}, 500., 1/(40 * 365)]
 ```
 
 ```{code-cell} ipython3
@@ -421,9 +425,12 @@ y_max_full = {
 
 ```{code-cell} ipython3
 key_i, key = random.split(key)
-X_lhs_full = sample(lhs_train_space, train_samples, key_i)
-y_lhs_full = vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0])(*X_lhs_full)
+with jax.default_device(cpu_device):
+    X_lhs_full = sample(lhs_train_space, train_samples, key_i)
+    y_lhs_full = vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0])(*X_lhs_full)
+```
 
+```{code-cell} ipython3
 surrogate_lhs_full = make_surrogate(
     X_lhs_full,
     y_lhs_full,
@@ -464,6 +471,33 @@ prior_full_state = train_surrogate(
     X_prior_full,
     y_prior_full,
     surrogate_prior_full,
+    mse,
+    key_i,
+    variables,
+    epochs=1000
+)
+```
+
+```{code-cell} ipython3
+with jax.default_device(cpu_device):
+    index = random.choice(key_i, train_samples * 2, (train_samples,))
+    X_comb_full = tree_map(lambda x, y: jnp.concatenate([x, y])[index], X_prior_full, X_lhs_full)
+    y_comb_full = tree_map(lambda x, y: jnp.concatenate([x, y])[index], y_prior_full, y_lhs_full)
+
+surrogate_comb_full = make_surrogate(
+    X_comb_full,
+    y_comb_full,
+    y_min=y_min_full,
+    y_max=y_max_full,
+    dropout_rate=.2,
+    batch_norm=False
+)
+key_i, key = random.split(key)
+variables = pytree_init(key_i, surrogate_comb_full, _freeze_attr(X_comb_full))
+comb_full_state = train_surrogate(
+    X_comb_full,
+    y_comb_full,
+    surrogate_comb_full,
     mse,
     key_i,
     variables,
@@ -562,9 +596,7 @@ def prev_stats_batch(params):
 
 ```{code-cell} ipython3
 def surrogate_impl_full(surrogate, params):
-    def clip(stats):
-        return tree_map(lambda x: jnp.minimum(x, 1.), stats)
-    return lambda p, e, a: clip(prev_stats_multisite(p, e, a, lambda p_, e_, a_: full_solution_surrogate(surrogate, params, sort_dict(p_), e_, a_)))
+    return lambda p, e, a: prev_stats_multisite(p, e, a, lambda p_, e_, a_: full_solution_surrogate(surrogate, params, sort_dict(p_), e_, a_))
 
 def surrogate_impl_fixed(surrogate, params):
     return lambda p, e, a: fixed_surrogate(surrogate, params, sort_dict(p))
@@ -661,6 +693,10 @@ prior_full_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: ful
 ```
 
 ```{code-cell} ipython3
+comb_full_prior_curves = get_curves(prior, EIRs, etas, impl=lambda p, e, a: full_solution_surrogate(surrogate_comb_full, comb_full_state, sort_dict(p), e, a))
+```
+
+```{code-cell} ipython3
 n_curves = 500
 fig, axs = plt.subplots(3, len(EIRs), sharey='row', sharex=True)
 imm_labels = ['prob_b', 'prob_c', 'prob_d']
@@ -688,7 +724,7 @@ for i in range(len(EIRs)):
     )
     axs[0, i].xaxis.set_label_position('top')
     for imm_i, imm in enumerate(imm_labels):
-        axs[imm_i, i].plot(prior_full_prior_curves[imm][i, :n_curves, :].T, color='r', alpha=.01)
+        axs[imm_i, i].plot(comb_full_prior_curves[imm][i, :n_curves, :].T, color='r', alpha=.01)
         axs[imm_i, i].plot(true_curves[imm][i, 0, :])
         axs[imm_i, 0].set_ylabel(imm)
         
@@ -727,7 +763,7 @@ for i in range(len(EIRs)):
             f'EIR: {EIRs[i]}'
         )
         axs[0, i].xaxis.set_label_position('top')
-        axs[prev_i, i].plot(prior_full_prior_curves[prev][i, :n_curves, :].T / prior_full_prior_curves['prop'][i, :n_curves, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(comb_full_prior_curves[prev][i, :n_curves, :].T / comb_full_prior_curves['prop'][i, :n_curves, :].T, color='r', alpha=.01)
         axs[prev_i, i].plot(true_curves[prev][i, 0, :] / true_curves['prop'][i, 0, :].T)
         axs[prev_i, 0].set_ylabel(prev)
         #axs[prev_i, 0].set_yscale('log')
@@ -747,8 +783,8 @@ def surrogate_posterior_fixed(surrogate, params, key):
 import numpyro
 
 def surrogate_posterior(surrogate, params, key, impl):
-    n_samples = 100
-    n_warmup = 100
+    n_samples = 500
+    n_warmup = 500
 
     kernel = NUTS(model, forward_mode_differentiation=True) # Reverse mode has lead to initialisation errors
 
@@ -785,6 +821,13 @@ y_post_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, prior_f
 ```
 
 ```{code-cell} ipython3
+comb_full_mcmc = surrogate_posterior_full(surrogate_comb_full, comb_full_state, key)
+X_post_comb_full = comb_full_mcmc.get_samples()
+y_post_comb_full = prev_stats_batch(X_post_comb_full)
+y_post_comb_full_hat = prev_stats_surrogate_batch(surrogate_comb_full, comb_full_state, {k: v for k, v in X_post_comb_full.items() if k != 'EIR'})
+```
+
+```{code-cell} ipython3
 prior_fixed_mcmc = surrogate_posterior_fixed(surrogate_prior_fixed, params_prior_fixed, key)
 X_post_prior_fixed = prior_fixed_mcmc.get_samples()
 y_post_prior_fixed = prev_stats_batch(X_post_prior_fixed)
@@ -809,6 +852,10 @@ y_val_lhs_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, para
 
 ```{code-cell} ipython3
 y_val_prior_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, prior_full_state, sort_dict(without_obs(prior)))
+```
+
+```{code-cell} ipython3
+y_val_prior_comb_full_hat = prev_stats_surrogate_batch(surrogate_comb_full, comb_full_state, sort_dict(without_obs(prior)))
 ```
 
 ```{code-cell} ipython3
@@ -897,7 +944,11 @@ print(approximation_error(
 ```
 
 ```{code-cell} ipython3
-jnp.mean(jnp.abs(jnp.concatenate(y_val_prior, axis=2) - jnp.concatenate(y_val_prior_prior_full_hat, axis=2)) / jnp.concatenate(y_val_prior, axis=2))
+jnp.mean(jnp.abs(jnp.concatenate(y_val_prior, axis=2) - jnp.concatenate(y_val_prior_comb_full_hat, axis=2)) / jnp.concatenate(y_val_prior, axis=2))
+```
+
+```{code-cell} ipython3
+jnp.mean(jnp.abs(jnp.concatenate(y_post_comb_full, axis=2) - jnp.concatenate(y_post_comb_full_hat, axis=2)) / jnp.concatenate(y_post_comb_full, axis=2))
 ```
 
 ```{code-cell} ipython3
@@ -936,6 +987,14 @@ posterior_predictive = Predictive(
 ```
 
 ```{code-cell} ipython3
+comb_full_samples = comb_full_mcmc.get_samples()
+comb_full_predictive = Predictive(
+    model,
+    comb_full_samples
+)(key, obs_prev, obs_inc)
+```
+
+```{code-cell} ipython3
 prior_full_samples = prior_full_mcmc.get_samples()
 prior_full_predictive = Predictive(
     model,
@@ -967,9 +1026,10 @@ ks_data = pd.concat([
         for k in sample_keys
         for name, posterior in [
             #('prior_fixed', prior_fixed_mcmc.get_samples()),
-            ('prior_full', prior_full_mcmc.get_samples()),
+            #('prior_full', prior_full_mcmc.get_samples()),
             #('lhs_fixed', lhs_fixed_mcmc.get_samples()),
-            #('lhs_full', lhs_full_mcmc.get_samples())
+            #('lhs_full', lhs_full_mcmc.get_samples()),
+            ('comb_full', comb_full_mcmc.get_samples())
         ]
         if k != 'EIR'
     ]),
@@ -984,9 +1044,11 @@ ks_data = pd.concat([
         }
         for name, posterior in [
             #('prior_fixed', prior_fixed_mcmc.get_samples()),
-            ('prior_full', prior_full_mcmc.get_samples()),
+            #('prior_full', prior_full_mcmc.get_samples()),
+            #('comb_full', comb_full_mcmc.get_samples())
             #('lhs_fixed', lhs_fixed_mcmc.get_samples()),
             #('lhs_full', lhs_full_mcmc.get_samples())
+            ('comb_full', comb_full_mcmc.get_samples())
         ]
         for i in range(posterior['EIR'].shape[1])
     ])
@@ -1079,7 +1141,7 @@ pyro_data = az.from_numpyro(
 pyro_data_surrogate = az.from_numpyro(
     prior_full_mcmc,
     prior=prior,
-    posterior_predictive=prior_full_predictive
+    posterior_predictive=comb_full_predictive
 )
 ```
 
@@ -1091,15 +1153,28 @@ axs = az.plot_dist_comparison(
     pyro_data_surrogate,
     ax=axs
 )
+
+for i, key in enumerate(keys):
+    if key == 'EIR':
+        for j in range(n_sites):
+            axs[j, 2].vlines(
+                EIRs[j],
+                0,
+                axs[j, 2].get_ylim()[1],
+                color = 'red',
+                linestyle = 'dashed'
+            )
+    else:
+        j = i + n_sites - 1
+        axs[j, 2].vlines(
+            true_values[key][0],
+            0,
+            axs[j, 2].get_ylim()[1],
+            color = 'red',
+            linestyle = 'dashed'
+        )
+        
 for i in range(axs.shape[0]):
-    
-    #axs[i, 2].vlines(
-    #    true_values[keys[i]][0],
-    #    0,
-    #    axs[i, 2].get_ylim()[1],
-    #    color = 'red',
-    #    linestyle = 'dashed'
-    #)
     s_prior_lines = [axs[i, 0].get_lines()[1], axs[i, 2].get_lines()[2]]
     s_posterior_lines = [axs[i, 1].get_lines()[1], axs[i, 2].get_lines()[3]]
     for s_prior_line in s_prior_lines:
@@ -1126,7 +1201,7 @@ for i in range(len(EIRs)):
     )
     axs[0, i].xaxis.set_label_position('top')
     for imm_i, imm in enumerate([f'prob_{l}' for l in imm_labels]):
-        axs[imm_i, i].plot(posterior_curves_surrogate[imm][i, :, :].T, color='r', alpha=.01)
+        axs[imm_i, i].plot(posterior_curves_surrogate[imm][i, :n_curves, :].T, color='r', alpha=.01)
         axs[imm_i, i].plot(true_curves[imm][i, 0, :].T)
         axs[imm_i, 0].set_ylabel(f'prob. {imm_labels[imm_i]}')
         
@@ -1143,13 +1218,57 @@ for i in range(len(EIRs)):
     for prev_i, prev in enumerate(prev_labels):
         axs[0, i].set_xlabel(f'EIR: {EIRs[i]}')
         axs[0, i].xaxis.set_label_position('top')
-        axs[prev_i, i].plot(posterior_curves_surrogate[prev][i, :, :].T / posterior_curves_surrogate['prop'][i, :, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(posterior_curves_surrogate[prev][i, :n_curves, :].T / posterior_curves_surrogate['prop'][i, :n_curves, :].T, color='r', alpha=.01)
         axs[prev_i, i].plot(true_curves[prev][i, 0, :] / true_curves['prop'][i, 0, :])
         axs[prev_i, 0].set_ylabel(prev)
         
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
 fig.text(0.5, 1, 'Surrogate posterior pos_M/inc function', ha='center')
+```
+
+```{code-cell} ipython3
+def get_immunity_curve(params):
+    exposures = jnp.arange(100)
+    (b0, IB0, kb) = params['b0'], params['IB0'], params['kb']
+    (phi0, phi1, IC0, kc) = params['phi0'], params['phi1'], params['IC0'], params['kc']
+    (d1, ID0, fd0, gd, ad0, kd) = params['d1'], params['ID0'], params['fd0'], params['gd'], params['ad0'], params['kd']
+    b1 = dmeq.default_parameters()['b1']
+    a = 5 * 365
+    fd = 1-(1-fd0)/(1+(a/ad0)**gd)
+    return {
+        'prob_b': b0 * ((1 - b1)/(1 + (exposures/IB0)**kb) + b1),
+        'prob_c': phi0 * ((1 - phi1)/(1 + (exposures/IC0)**kc) + phi1),
+        'prob_d': d1 + (1 - d1)/(1 + fd * (exposures/ID0)**kd)
+    }
+
+def get_batch_imm_curves(params):
+    return vmap(
+        get_immunity_curve,
+        in_axes=[
+            {k: 0 for k in params.keys()}
+        ]
+    )(params)
+```
+
+```{code-cell} ipython3
+posterior_imm_curves = get_batch_imm_curves(prior_full_samples)
+true_imm_curves = get_batch_imm_curves(without_obs(true_values))
+```
+
+```{code-cell} ipython3
+n_curves = 500
+fig, axs = plt.subplots(1, 3)
+imm_labels = ['prob_b', 'prob_c', 'prob_d']
+
+for imm_i, imm in enumerate(imm_labels):
+    axs[imm_i].plot(posterior_imm_curves[imm][:n_curves, :].T, color='r', alpha=.1)
+    axs[imm_i].plot(true_imm_curves[imm][0, :])
+    axs[imm_i].set_ylabel(imm)
+        
+fig.tight_layout()
+fig.text(0.5, 0, 'Exposures (number)', ha='center')
+fig.text(0.5, 1, 'Surrogate posterior immunity probability function', ha='center')
 ```
 
 ```{code-cell} ipython3
