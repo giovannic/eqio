@@ -4,24 +4,45 @@
 cpu_count = 100
 import os
 os.environ['XLA_FLAGS'] = f'--xla_force_host_platform_device_count={cpu_count}'
-import matplotlib.pyplot as plt
+import jax
+jax.config.update('jax_enable_x64', True)
 import jax.numpy as jnp
 from jax import random, jit, vmap
 import dmeq
 from mox.sampling import LHSStrategy
 import numpyro
 from numpyro.infer import MCMC, NUTS, Predictive
+from numpyro.diagnostics import summary
 import numpyro.distributions as dist
+from scipy.stats import ks_2samp
 import arviz as az
 import pandas as pd
+import pickle
+from time import time
+import logging
+logging.basicConfig(
+    format='%(asctime)s.%(msecs)03d %(levelname)s %(module)s - %(funcName)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
+def timing(f):
+    def wrap(*args, **kw):
+        ts = time()
+        result = f(*args, **kw)
+        te = time()
+        return te-ts, result
+    return wrap
 
 key = random.PRNGKey(42)
-n_chains = 10
-
-
+cpu_device = jax.devices('cpu')[0]
+n_chains = 4
+epochs = 1000
+n_rounds = 5
 
 def full_solution(params, eir, eta):
+    max_age = 99
     p = dmeq.default_parameters()
     for k, v in params.items():
         p[k] = v
@@ -29,36 +50,29 @@ def full_solution(params, eir, eta):
     p['eta'] = eta
     s = dmeq.solve(p, dtype=jnp.float64)
     return {
-        'pos_M': s[0],
-        'inc': s[1],
-        'prob_b': s[3],
-        'prob_c': s[4],
-        'prob_d': s[5],
-        'prop': s[2],
+        'pos_M': s[0][:max_age],
+        'inc': s[1][:max_age],
+        'prob_b': s[2][:max_age],
+        'prob_c': s[3][:max_age],
+        'prob_d': s[4][:max_age],
+        'prop': s[5][:max_age],
     }
 
-
-
-population = 1_000_000
+person_risk_time = 1_000 * 365.
 prev_N = 1_000
 
 def prev_stats(solution):
-    inc_rates = solution['inc'] * solution['prop'] * population
     return (
         jnp.array([
             solution['pos_M'][3:10].sum() / solution['prop'][3:10].sum(), # Prev 2 - 10
             solution['pos_M'][10:].sum() / solution['prop'][10:].sum(), # Prev 10+
         ]),
-        jnp.maximum(
-            jnp.array([
-                inc_rates[:5].sum(), # Inc 0 - 5
-                inc_rates[5:15].sum(), # Inc 5 - 15
-                inc_rates[15:].sum() # Inc 15+
-            ]),
-            1e-12
-        )
+        jnp.array([
+            solution['inc'][:5].sum() / solution['prop'][:5].sum(), # Inc 0 - 5
+            solution['inc'][5:15].sum() / solution['prop'][5:15].sum(), # Inc 5 - 15
+            solution['inc'][15:].sum() / solution['prop'][15:].sum() # Inc 15+
+        ])
     )
-
 
 # In[8]:
 
@@ -73,8 +87,9 @@ prev_stats_multisite = vmap(
 
 
 EIRs = jnp.array([0.05, 3.9, 15., 20., 100., 150., 418.])
+n_sites = EIRs.shape[0]
 key, key_i = random.split(key)
-etas = 1. / random.uniform(key_i, shape=EIRs.shape, minval=20*365, maxval=40*365, dtype=jnp.float64)
+etas = 1. / random.uniform(key_i, shape=(n_sites,), minval=40*365, maxval=100*365, dtype=jnp.float64)
 
 
 # In[10]:
@@ -90,75 +105,72 @@ from mox.sampling import DistStrategy
 prior_parameter_space = [
     {
         'kb': DistStrategy(dist.LogNormal(0., .25)),
-        'ub': DistStrategy(dist.LogNormal(0., .25)),
+        'ub': DistStrategy(dist.LogNormal(0., 1.)),
         'b0': DistStrategy(dist.Beta(1., 1.)),
-        'IB0': DistStrategy(dist.LeftTruncatedDistribution(dist.Normal(50., 10.), low=0.)),
+        'IB0': DistStrategy(dist.TruncatedDistribution(dist.Normal(50., 20.), low=25., high=75.)),
         'kc': DistStrategy(dist.LogNormal(0., .25)),
-        'uc': DistStrategy(dist.LogNormal(0., .25)),
-        'IC0': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(100., 10.), low=0.)),
-        'phi0': DistStrategy(dist.Beta(5., 1.)),
-        'phi1': DistStrategy(dist.Beta(1., 2.)),
+        'uc': DistStrategy(dist.LogNormal(0., 1.)),
+        'IC0': DistStrategy(dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)),
+        'phi0': DistStrategy(dist.Beta(2., 1.)),
+        'phi1': DistStrategy(dist.Beta(1., 5.)),
         'PM': DistStrategy(dist.Beta(1., 1.)),
-        'dm': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(200., 10.), low=0.)),
+        'dm': DistStrategy(dist.TruncatedDistribution(dist.Normal(50., 20.), low=5., high=100.)),
         'kd': DistStrategy(dist.LogNormal(0., .25)),
-        'ud': DistStrategy(dist.LogNormal(0., .25)),
-        'd1': DistStrategy(dist.Beta(1., 2.)),
-        'ID0': DistStrategy(dist.LeftTruncatedDistribution(dist.Cauchy(25., 1.), low=0.)),
+        'ud': DistStrategy(dist.LogNormal(0., 1.)),
+        'd1': DistStrategy(dist.Beta(1., 1.)),
+        'ID0': DistStrategy(dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)),
         'fd0': DistStrategy(dist.Beta(1., 1.)),
-        'gd': DistStrategy(dist.LogNormal(0., .25)),
+        'gd': DistStrategy(dist.LogNormal(0., 2.)),
         'ad0': DistStrategy(dist.TruncatedDistribution(
-            dist.Cauchy(30. * 365., 365.),
-            low=20. * 365.,
-            high=40. * 365.
+            dist.Normal(70. * 365., 365.),
+            low=40. * 365.,
+            high=100. * 365.
         )),
-        'rU': DistStrategy(dist.LogNormal(0., .25)),
-        'cD': DistStrategy(dist.Beta(1., 2.)),
-        'cU': DistStrategy(dist.Beta(1., 5.)),
-        'g_inf': DistStrategy(dist.LogNormal(0., .25))
+        'rU': DistStrategy(dist.LogNormal(0., 1.))
     },
+    #DistStrategy(SiteDistribution({'EIR': est_EIR, 'etas': etas}, noise))
     DistStrategy(dist.Uniform(0., 500.)), # EIR
-    DistStrategy(dist.Uniform(1/(40 * 365), 1/(20 * 365))) # eta
+    DistStrategy(dist.Uniform(1/(100 * 365), 1/(40 * 365))) # eta
 ]
 
 
 # In[12]:
 
 
-def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
+def model(true_EIRs=None, prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
+    with numpyro.plate('sites', n_sites):
+        EIR = numpyro.sample('EIR', dist.Uniform(0., 500.), obs=true_EIRs)
+    
     # Pre-erythrocytic immunity
     kb = numpyro.sample('kb', dist.LogNormal(0., .25))
-    ub = numpyro.sample('ub', dist.LogNormal(0., .25))
+    ub = numpyro.sample('ub', dist.LogNormal(0., 1.))
     b0 = numpyro.sample('b0', dist.Beta(1., 1.))
-    IB0 = numpyro.sample('IB0', dist.LeftTruncatedDistribution(dist.Normal(50., 10.), low=0.))
+    IB0 = numpyro.sample('IB0', dist.TruncatedDistribution(dist.Normal(50., 20.), low=25., high=75.))
     
     # Clinical immunity
     kc = numpyro.sample('kc', dist.LogNormal(0., .25))
-    uc = numpyro.sample('uc', dist.LogNormal(0., .25))
-    phi0 = numpyro.sample('phi0', dist.Beta(5., 1.))
-    phi1 = numpyro.sample('phi1', dist.Beta(1., 2.))
-    IC0 = numpyro.sample('IC0',dist.LeftTruncatedDistribution(dist.Cauchy(100., 10.), low=0.))
+    uc = numpyro.sample('uc', dist.LogNormal(0., 1.))
+    phi0 = numpyro.sample('phi0', dist.Beta(2., 1.))
+    phi1 = numpyro.sample('phi1', dist.Beta(1., 5.))
+    IC0 = numpyro.sample('IC0',dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.))
     PM = numpyro.sample('PM', dist.Beta(1., 1.))
-    dm = numpyro.sample('dm', dist.LeftTruncatedDistribution(dist.Cauchy(200., 10.), low=0.))
+    dm = numpyro.sample('dm', dist.TruncatedDistribution(dist.Normal(50., 20.), low=5., high=100.))
     
     # Detection immunity
     kd = numpyro.sample('kd', dist.LogNormal(0., .25))
-    ud = numpyro.sample('ud', dist.LogNormal(0., .25))
-    d1 = numpyro.sample('d1', dist.Beta(1., 2.))
-    ID0 = numpyro.sample('ID0', dist.LeftTruncatedDistribution(dist.Cauchy(25., 1.), low=0.))
+    ud = numpyro.sample('ud', dist.LogNormal(0., 1.))
+    d1 = numpyro.sample('d1', dist.Beta(1., 1.))
+    ID0 = numpyro.sample('ID0', dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.))
     fd0 = numpyro.sample('fd0', dist.Beta(1., 1.))
-    gd = numpyro.sample('gd', dist.LogNormal(0., .25))
+    gd = numpyro.sample('gd', dist.LogNormal(0., 2.))
     ad0 = numpyro.sample('ad0', dist.TruncatedDistribution(
-            dist.Cauchy(30. * 365., 365.),
-            low=20. * 365.,
-            high=40. * 365.
-        ))
+            dist.Cauchy(70. * 365., 365.),
+            low=40. * 365.,
+            high=100. * 365.
+        )
+    )
     
-    ru = numpyro.sample('rU', dist.LogNormal(0., .25))
-    
-    # FOIM
-    cd = numpyro.sample('cD', dist.Beta(1., 2.))
-    cu = numpyro.sample('cU', dist.Beta(1., 5.))
-    g_inf = numpyro.sample('g_inf', dist.LogNormal(0., .25))
+    ru = numpyro.sample('rU', dist.LogNormal(0., 1.))
     
     x = {
         'kb': kb,
@@ -179,19 +191,16 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
         'fd0': fd0,
         'gd': gd,
         'ad0': ad0,
-        'rU': ru,
-        'cD': cd,
-        'cU': cu,
-        'g_inf': g_inf
+        'rU': ru
     }
     
-    prev_stats, inc_stats = impl(x, EIRs, etas)
+    prev_stats, inc_stats = impl(x, EIR, etas)
     
     numpyro.sample(
         'obs_prev',
         dist.Independent(
             dist.Binomial(total_count=prev_N, probs=prev_stats, validate_args=True),
-            1
+            2
         ),
         obs=prev
     )
@@ -199,15 +208,16 @@ def model(prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a
     numpyro.sample(
         'obs_inc',
         dist.Independent(
-            dist.Poisson(rate=jnp.maximum(inc_stats, 1e-12)),
-            1
+            dist.Poisson(rate=jnp.maximum(inc_stats * person_risk_time, 1e-12)),
+            2
         ),
         obs=inc
     )
 
 
+logger.info('Making truth')
 key, key_i = random.split(key)
-true_values = Predictive(model, num_samples=1)(key_i)
+true_values = Predictive(model, num_samples=1)(key_i, true_EIRs=EIRs)
 
 
 obs_inc, obs_prev = (true_values['obs_inc'], true_values['obs_prev'])
@@ -219,22 +229,24 @@ print(pd.DataFrame(
 ).to_latex(index=False))
 
 
-
 def without_obs(params):
     return {k : v for k, v in params.items() if not k in {'obs_inc', 'obs_prev'}}
 
 
+logger.info('Sampling prior')
 key, key_i = random.split(key)
-prior = Predictive(model, num_samples=600)(key)
+with jax.default_device(cpu_device):
+    prior = Predictive(model, num_samples=600)(key_i)
+logger.info('done')
 
 
 from jax import pmap, tree_map
-import jax
 import pandas as pd
-from scipy.stats.qmc import LatinHypercube
 
 device_count = len(jax.devices())
 
+max_val = jnp.finfo(jnp.float64).max
+min_val = jnp.finfo(jnp.float64).smallest_normal
 
 # Create the X_lhs dataset
 intrinsic_bounds = pd.DataFrame.from_records([
@@ -244,22 +256,19 @@ intrinsic_bounds = pd.DataFrame.from_records([
     ('IB0', 0, 100),
     ('kc', 0, 10),
     ('uc', 0, 10),
-    ('IC0', 0, 200),
+    ('IC0', 0, 50),
     ('phi0', 0, 1),
     ('phi1', 0, 1),
     ('PM', 0, 1),
-    ('dm', 0, 500),
-    ('kd', .01, 10),
+    ('dm', 0, 100),
+    ('kd', min_val, 10),
     ('ud', 0, 10),
     ('d1', 0, 1),
-    ('ID0', 0, 100),
+    ('ID0', 0, 50),
     ('fd0', 0, 1),
     ('gd', 0, 10),
-    ('ad0', 20 * 365, 40 * 365),
-    ('rU', 0, 1/100),
-    ('cD', 0, 1),
-    ('cU', 0, 1),
-    ('g_inf', 0, 10)
+    ('ad0', 40 * 365, 100 * 365),
+    ('rU', 0, 1),
 ], columns=['name', 'lower', 'upper'])
 
 lhs_parameter_space = [
@@ -291,97 +300,206 @@ print(pd.concat([intrinsic_bounds]).to_latex(index=False, float_format="{:0.0f}"
 # In[21]:
 
 
-max_val = jnp.finfo(jnp.float32).max
-min_val = jnp.finfo(jnp.float32).smallest_normal
-
 
 # In[22]:
 
-
 from mox.sampling import sample
-from mox.surrogates import make_surrogate, pytree_init
+from mox.surrogates import (
+    make_surrogate,
+    init_surrogate,
+    apply_surrogate,
+    #MLP
+)
 from mox.training import train_surrogate
 from mox.loss import mse
+from mox.utils import tree_leading_axes as tla
 
 
+max_age = 99
 y_min_full = {
-    'pos_M': jnp.full((100,), 0.),
-    'inc': jnp.full((100,), 0.),
-    'prob_b': jnp.full((100,), 0.),
-    'prob_c': jnp.full((100,), 0.),
-    'prob_d': jnp.full((100,), 0.),
-    'prop': jnp.full((100,), min_val)
+    'pos_M': jnp.full((max_age,), 0.),
+    'inc': jnp.full((max_age,), 0.),
+    'prob_b': jnp.full((max_age,), 0.),
+    'prob_c': jnp.full((max_age,), 0.),
+    'prob_d': jnp.full((max_age,), 0.),
+    'prop': jnp.full((max_age,), 1e-12)
 }
 
 y_max_full = {
-    'pos_M': jnp.full((100,), 1.),
-    'inc': jnp.full((100,), max_val),
-    'prob_b': jnp.full((100,), 1.),
-    'prob_c': jnp.full((100,), 1.),
-    'prob_d': jnp.full((100,), 1.),
-    'prop': jnp.full((100,), 1.)
+    'pos_M': jnp.full((max_age,), 1.),
+    'inc': jnp.full((max_age,), max_val),
+    'prob_b': jnp.full((max_age,), 1.),
+    'prob_c': jnp.full((max_age,), 1.),
+    'prob_d': jnp.full((max_age,), 1.),
+    'prop': jnp.full((max_age,), 1.)
 }
 
 y_min_fixed = (0., min_val)
 y_max_fixed = (1., max_val)
 
-from flax.linen.module import _freeze_attr
+from flax import linen as nn
 
+# TODO: update mox MLP
+class MLP(nn.Module):
+    """MLP. A multi layer perceptron
+    """
+
+    units: int
+    n_hidden: int
+    n_output: int
+    dropout_rate: float
+    batch_norm: bool
+    dtype = jnp.float64
+
+    @nn.compact
+    def __call__(self, x, training: bool):
+        denses = [nn.Dense(self.units, param_dtype=self.dtype) for _ in range(self.n_hidden)]
+        dropouts = [
+            nn.Dropout(rate=self.dropout_rate, deterministic=not training)
+            for _ in range(self.n_hidden)
+        ]
+        if self.batch_norm:
+            norms = [
+                nn.BatchNorm(use_running_average=not training)
+                for _ in range(self.n_hidden)
+            ]
+            layers = zip(denses, dropouts, norms)
+            for dense, dropout, norm in layers:
+                x = dense(x)
+                x = norm(x)
+                x = dropout(x)
+                x = nn.relu(x)
+        else:
+            layers = zip(denses, dropouts)
+            for dense, dropout in layers:
+                x = dense(x)
+                x = dropout(x)
+                x = nn.relu(x)
+
+        return nn.Dense(self.n_output)(x)
+
+def make_net(surrogate, y):
+    y0 = tree_map(lambda x: x[0], y)
+    y0_vec = surrogate.vectorise_output(y0)
+    return MLP(
+        units=265,
+        n_hidden=2,
+        n_output=jnp.size(y0_vec),
+        dropout_rate=.2,
+        batch_norm=False
+    )
 
 # In[28]:
 
-
 # Write function for validation set generation
-def full_solution_surrogate(surrogate, surrogate_params, params, eir, eta):
-    surrogate_input = _freeze_attr([params, eir, eta])
-    return surrogate.apply(surrogate_params, surrogate_input)
-
-def fixed_surrogate(surrogate, surrogate_params, params):
-    surrogate_input = _freeze_attr([params])
-    return surrogate.apply(surrogate_params, surrogate_input)
+def apply_dmeq_surrogate(surrogate, net, net_params, params, eir, eta):
+    return tree_map(
+        lambda leaf: leaf[0, 0],
+        apply_surrogate(
+            surrogate,
+            net,
+            {'params': net_params},
+            tree_map(jnp.atleast_1d, [params, eir, eta])
+        )
+    )
 
 def prev_stats_surrogate(*args):
-    return prev_stats(full_solution_surrogate(*args))
+    return prev_stats(apply_dmeq_surrogate(*args))
 
-def prev_stats_surrogate_batch(surrogate, surrogate_params, params):
-    f = lambda p, e, a: full_solution_surrogate(surrogate, surrogate_params, p, e, a)
-    return vmap(
-        lambda p, e, a: prev_stats_multisite(p, e, a, f),
-        in_axes=[{k: 0 for k in params.keys()}, None, None]
-    )(params, EIRs, etas)
+def posterior_EIR(params):
+    return params['EIR'], {k: v for k, v in params.items() if k != 'EIR'}
 
-def prev_stats_fixed_surrogate_batch(surrogate, surrogate_params, params):
+def prev_stats_full_surrogate_posterior(surrogate, net, net_params, params):
+    eir, params = posterior_EIR(params)
+    f = lambda p, e, a: apply_dmeq_surrogate(surrogate, net, net_params, p, e, a)
     return vmap(
-        lambda p: fixed_surrogate(surrogate, surrogate_params, p),
-        in_axes=[{k: 0 for k in params.keys()}]
-    )(params)
+        lambda p, e, a: vmap(lambda _e, _a: prev_stats(f(p, _e, _a)))(e, a),
+        in_axes=[{k: 0 for k in params.keys()}, 0, None]
+    )(params, eir, etas)
+
+def prev_stats_fixed_surrogate_posterior(surrogate, net, net_params, params):
+    eir, params = posterior_EIR(params)
+    return vmap(
+        lambda p, e, a: vmap(
+            apply_dmeq_surrogate,
+            in_axes=[None, None, None, None, 0, 0]
+        )(surrogate, net, net_params, p, e, a),
+        in_axes=[{k: 0 for k in params.keys()}, 0, None]
+    )(params, eir, etas)
 
 def sort_dict(d):
     return {k: d[k] for k in intrinsic_bounds.name}
 
-def prev_stats_batch(params):
+def prev_stats_posterior(params):
+    eir, params = posterior_EIR(params)
     return vmap(
-        lambda p, e, a: prev_stats_multisite(p, e, a, full_solution),
-        in_axes=[{k: 0 for k in params.keys()}, None, None]
-    )(params, EIRs, etas)
+        lambda p, e, a: vmap(lambda _e, _a: prev_stats(full_solution(p, _e, _a)))(e, a),
+        in_axes=[{k: 0 for k in params.keys()}, 0, None]
+    )(params, eir, etas)
 
-def surrogate_impl_full(surrogate, params):
-    return lambda p, e, a: prev_stats_multisite(p, e, a, lambda p_, e_, a_: full_solution_surrogate(surrogate, params, sort_dict(p_), e_, a_))
+def sample_full_from_posterior(params):
+    eir, params = posterior_EIR(params)
+    n = eir.shape[0]
+    X = [
+        tree_map(lambda leaf: jnp.repeat(leaf, n_sites), params),
+        jnp.reshape(eir, -1),
+        jnp.tile(etas, n)
+    ]
+    y = vmap(
+        lambda p, e, a: vmap(lambda _e, _a: full_solution(p, _e, _a))(e, a),
+        in_axes=[{k: 0 for k in params.keys()}, 0, None]
+    )(params, eir, etas)
+    y = tree_map(lambda leaf: leaf.reshape((-1, leaf.shape[-1])), y)
+    return X, y
 
-def surrogate_impl_fixed(surrogate, params):
-    return lambda p, e, a: fixed_surrogate(surrogate, params, sort_dict(p))
+def sample_fixed_from_posterior(params):
+    eir, params = posterior_EIR(params)
+    n = eir.shape[0]
+    X = [
+        tree_map(lambda leaf: jnp.repeat(leaf, n_sites), params),
+        jnp.reshape(eir, -1),
+        jnp.tile(etas, n)
+    ]
+    y = vmap(
+        lambda p, e, a: vmap(lambda _e, _a: prev_stats(full_solution(p, _e, _a)))(e, a),
+        in_axes=[{k: 0 for k in params.keys()}, 0, None]
+    )(params, eir, etas)
+    y = tree_map(lambda leaf: leaf.reshape((-1, leaf.shape[-1])), y)
+    return X, y
 
-def surrogate_posterior_full(surrogate, params, key):
-    return surrogate_posterior(surrogate, params, key, surrogate_impl_full(surrogate, params))
+def surrogate_impl_full(surrogate, net, net_params):
+    return lambda p, e, a: prev_stats_multisite(
+        p,
+        e,
+        a,
+        lambda p_, e_, a_: apply_dmeq_surrogate(
+            surrogate,
+            net,
+            net_params,
+            sort_dict(p_),
+            e_,
+            a_
+        )
+    )
 
-def surrogate_posterior_fixed(surrogate, params, key):
-    return surrogate_posterior(surrogate, params, key, surrogate_impl_fixed(surrogate, params))
+def surrogate_impl_fixed(surrogate, net, net_params):
+    return lambda p, e, a: vmap(
+        apply_dmeq_surrogate,
+        in_axes=[None, None, None, None, 0, 0]
+    )(
+        surrogate,
+        net,
+        net_params,
+        sort_dict(p),
+        e,
+        a
+    )
 
 import numpyro
 
-def surrogate_posterior(surrogate, params, key, impl):
-    n_samples = 100
-    n_warmup = 100
+def surrogate_posterior(key, impl):
+    n_samples = 500
+    n_warmup = 500
 
     kernel = NUTS(model, forward_mode_differentiation=True) # Reverse mode has lead to initialisation errors
 
@@ -392,206 +510,312 @@ def surrogate_posterior(surrogate, params, key, impl):
         num_chains=n_chains,
         chain_method='vectorized' #pmap leads to segfault for some reason (https://github.com/google/jax/issues/13858)
     )
-    mcmc.run(key, obs_prev, obs_inc, impl)
+    mcmc.run(key, None, obs_prev, obs_inc, impl)
     return mcmc
 
+def surrogate_posterior_full(surrogate, net, params, key):
+    return surrogate_posterior(key, surrogate_impl_full(surrogate, net, params))
+
+def surrogate_posterior_fixed(surrogate, net, params, key):
+    return surrogate_posterior(key, surrogate_impl_fixed(surrogate, net, params))
 
 val_size = int(1e4)
-y_val_prior = prev_stats_batch(without_obs(prior))
-key, key_i = random.split(key)
-X_val_lhs = sample(lhs_parameter_space[0], val_size, key_i)
-y_val_lhs = prev_stats_batch(X_val_lhs)
 
+logger.info('Making validation set')
+y_val_prior = prev_stats_posterior(without_obs(prior))
+logger.info('done')
+key, key_i = random.split(key)
 
 def approximation_error(exps, labels, ys, y_hats):
     y_labels = ['prev2-10', 'prev10+', 'inc0-5', 'inc5-15', 'inc15+']
     ys = [jnp.concatenate(y, axis=2) for y in ys]
     y_hats = [jnp.concatenate(y_hat, axis=2) for y_hat in y_hats]
-    return pd.concat([
-        pd.DataFrame({
-            'L1': jnp.abs(y - y_hat)[i, :, j],
-            'RE': jnp.abs(y - y_hat)[i, :, j] / y[i, :, j],
+    return pd.DataFrame([
+        {
+            'mse': jnp.mean(jnp.square(y - y_hat)[:, i, j]),
+            'RE': jnp.mean(jnp.abs(y - y_hat)[:, i, j] / y[:, i, j]),
             'EIR': float(EIRs[i]),
             'output': y_labels[j],
             'test_set': label,
             'experiment': exp
-        })
+        }
         for i in range(len(EIRs))
         for j in range(len(y_labels))
         for exp, label, y, y_hat in zip(exps, labels, ys, y_hats)
     ])
 
-from flax.training import orbax_utils
-import orbax.checkpoint
+def mspe(key, labels, posteriors):
+    prev_columns = ['prev_2_10', 'prev_10+']
+    inc_columns = ['inc_0_5', 'inc_5_15', 'inc_15+']
+    keys = random.split(key, len(posteriors))
+    posterior_predictives = [
+        Predictive(model, p)(key_i)
+        for key_i, p in zip(keys, posteriors)
+    ]
+    return pd.concat([
+        pd.concat([
+            pd.DataFrame(
+                jnp.mean(jnp.square(obs_inc - pp['obs_inc']), axis=0),
+                columns=inc_columns
+            ).assign(EIR=EIRs),
+            pd.DataFrame(
+                jnp.mean(jnp.square(obs_prev - pp['obs_prev']), axis=0),
+                columns=prev_columns
+            ).assign(EIR=EIRs),
+        ], axis=1).assign(experiment=label)
+        for label, pp in zip(labels, posterior_predictives)
+    ])
 
-def save_model(name, surrogate, params):
-    ckpt = {
-        'surrogate': surrogate,
-        'params': params
-    }
-    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-    save_args = orbax_utils.save_args_from_target(ckpt)
-    orbax_checkpointer.save(f'orbax/{name}', ckpt, force=True, save_args=save_args)
+def save_mcmc(name, mcmc):
+    with open(f'chapter_2_mcmc_{name}.pkl', 'wb') as f:
+        pickle.dump(mcmc, f)
 
-    
 n_samples = 100
 n_warmup = 100
 
-mcmc = MCMC(
-    NUTS(model),
-    num_samples=n_samples,
-    num_warmup=n_warmup,
-    num_chains=n_chains,
-    chain_method='parallel'
-)
-mcmc.run(key, obs_prev, obs_inc)
-mcmc.print_summary(prob=0.7)
+if os.path.exists('chapter_2_mcmc_underlying.pkl'):
+    logger.info('Loading posterior')
+    with open('chapter_2_mcmc_underlying.pkl', 'rb') as f:
+        mcmc = pickle.load(f)
+    logger.info('done')
+else:
+    mcmc = MCMC(
+        NUTS(model),
+        num_samples=n_samples,
+        num_warmup=n_warmup,
+        num_chains=n_chains,
+        chain_method='vectorized'
+    )
+    logger.info('Sampling posterior')
+    mcmc.run(key_i, None, obs_prev, obs_inc)
+    logger.info('done')
+    save_mcmc('underlying', mcmc)
 
+mcmc.print_summary(prob=0.7)
 posterior_samples = mcmc.get_samples()
+logger.info('Writing underlying mspe')
+mspe(
+    key_i,
+    ['underlying'],
+    [posterior_samples]
+).to_csv(f'underlying_mspe.csv', index=False)
+logger.info('done')
+
+def make_surrogate_objects(samples, y_min, y_max):
+    X, y = samples
+    surrogate = make_surrogate(
+        X,
+        y,
+        y_min=y_min,
+        y_max=y_max
+    )
+    net = make_net(surrogate, y)
+    return surrogate, net
+
+
+def train_surrogate_objects(key, surrogate_obj, samples):
+    surrogate, net = surrogate_obj
+    X, y = samples
+    params = init_surrogate(key, surrogate, net, X)
+    return timing(train_surrogate)(
+        X,
+        y,
+        surrogate,
+        net,
+        mse,
+        key,
+        params,
+        epochs=epochs
+    )
+
+def perform_mcmc(key, mcmc_helper, val_helper, obj, train_state):
+    surrogate, net = obj
+    t, mcmc = timing(mcmc_helper)(
+        surrogate,
+        net,
+        train_state.params,
+        key
+    )
+    X_post = mcmc.get_samples()
+    y_post = prev_stats_posterior(X_post)
+    y_post_hat = val_helper(
+        surrogate,
+        net,
+        train_state.params,
+        X_post
+    )
+    summary_df = pd.DataFrame.from_dict(
+        summary(mcmc.get_samples(group_by_chain=True)),
+        orient='index'
+    ).reset_index()
+    return (
+        t,
+        summary_df,
+        X_post,
+        y_post,
+        y_post_hat
+    )
 
 def run_pipeline(train_samples, key):
+    experiments = [
+        'lhs_full',
+        'lhs_fixed',
+        'prior_full',
+        'prior_fixed'
+    ]
 
+    logger.info('Sampling LHS')
     key_i, key = random.split(key)
-    X_lhs_full = sample(lhs_parameter_space, train_samples, key_i)
-    y_lhs_full = vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0])(*X_lhs_full)
+    with jax.default_device(cpu_device):
+        X_lhs_full = sample(lhs_parameter_space, train_samples, key_i)
+        t_sample_lhs, y_lhs_full = timing(vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0]))(*X_lhs_full)
+        
+    X_lhs_fixed = X_lhs_full
+    y_lhs_fixed = vmap(prev_stats, in_axes=[tla(y_lhs_full)])(y_lhs_full)
 
-    surrogate_lhs_full = make_surrogate(
-        X_lhs_full,
-        y_lhs_full,
-        y_min=y_min_full,
-        y_max=y_max_full
-    )
+    logger.info('Sampling Prior')
     key_i, key = random.split(key)
-    params_lhs_full = train_surrogate(
-        X_lhs_full,
-        y_lhs_full,
-        surrogate_lhs_full,
-        mse,
-        key_i
-    )
+    with jax.default_device(cpu_device):
+        X_prior_full = sample(prior_parameter_space, train_samples, key_i)
+        t_sample_prior, y_prior_full = timing(vmap(full_solution, in_axes=tree_map(lambda x: 0, X_prior_full)))(*X_prior_full)
 
-    key_i, key = random.split(key)
-    X_prior_full = sample(prior_parameter_space, train_samples, key_i)
-    y_prior_full = vmap(full_solution, in_axes=tree_map(lambda x: 0, X_prior_full))(*X_prior_full)
+    X_prior_fixed = X_prior_full
+    y_prior_fixed = vmap(prev_stats, in_axes=[tla(y_prior_full)])(y_prior_full)
 
-    surrogate_prior_full = make_surrogate(
-        X_prior_full,
-        y_prior_full,
-        y_min=y_min_full,
-        y_max=y_max_full
-    )
-    key_i, key = random.split(key)
-    params_prior_full = train_surrogate(
-        X_prior_full,
-        y_prior_full,
-        surrogate_prior_full,
-        mse,
-        key_i
-    )
+    samples = [
+        (X_lhs_full, y_lhs_full),
+        (X_prior_full, y_prior_full),
+        (X_lhs_fixed, y_lhs_fixed),
+        (X_prior_fixed, y_prior_fixed)
+    ]
 
-    key_i, key = random.split(key)
-    X_lhs_fixed = sample(lhs_parameter_space[0:1], train_samples, key_i)
-    y_lhs_fixed = vmap(lambda p: prev_stats_multisite(p, EIRs, etas, full_solution), in_axes=[{n: 0 for n in intrinsic_bounds.name}])(*X_lhs_fixed)
+    logger.info('Making surrogates')
 
-    surrogate_lhs_fixed = make_surrogate(
-        X_lhs_fixed,
-        y_lhs_fixed,
-        y_min=y_min_fixed,
-        y_max=y_max_fixed
-    )
-    key_i, key = random.split(key)
-    params_lhs_fixed = train_surrogate(
-        X_lhs_fixed,
-        y_lhs_fixed,
-        surrogate_lhs_fixed,
-        mse,
-        key_i
-    )
+    surrogates = [
+        make_surrogate_objects(s, y_min_full, y_max_full)
+        for s in samples[:2]
+    ] + [
+        make_surrogate_objects(s, y_min_fixed, y_max_fixed)
+        for s in samples[2:]
+    ]
 
+    for r in range(n_rounds):
+        if os.path.exists(f'{train_samples}_round_{r}_approx_error.csv'):
+            continue
 
-    key_i, key = random.split(key)
-    X_prior_fixed = sample(prior_parameter_space[0:1], train_samples, key_i)
-    y_prior_fixed = vmap(lambda p: prev_stats_multisite(p, EIRs, etas, full_solution), in_axes=tree_map(lambda x: 0, X_prior_fixed))(*X_prior_fixed)
+        logger.info(f'Training surrogates: round {r}')
+        key, *keys = random.split(key, len(experiments) + 1)
 
-    surrogate_prior_fixed = make_surrogate(
-        X_prior_fixed,
-        y_prior_fixed,
-        y_min=y_min_fixed,
-        y_max=y_max_fixed
-    )
-    key_i, key = random.split(key)
-    params_prior_fixed = train_surrogate(
-        X_prior_fixed,
-        y_prior_fixed,
-        surrogate_prior_fixed,
-        mse,
-        key_i
-    )
-    
-    save_model(f'prior_fixed_{train_samples}', surrogate_prior_fixed, params_prior_fixed)
-    save_model(f'prior_full_{train_samples}', surrogate_prior_full, params_prior_full)
-    save_model(f'lhs_fixed_{train_samples}', surrogate_lhs_fixed, params_lhs_fixed)
-    save_model(f'lhs_full_{train_samples}', surrogate_lhs_full, params_lhs_full)
+        train_times, train_states = zip(
+            *[
+                train_surrogate_objects(key, obj, s)
+                for key, obj, s
+                in zip(
+                    keys,
+                    surrogates,
+                    samples
+                )
+            ]
+        )
 
-    lhs_full_mcmc = surrogate_posterior_full(surrogate_lhs_full, params_lhs_full, key)
-    X_post_lhs_full = lhs_full_mcmc.get_samples()
-    y_post_lhs_full = prev_stats_batch(X_post_lhs_full)
-    y_post_lhs_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, X_post_lhs_full)
+        logger.info('Performing MCMC')
+        key, *keys = random.split(key, len(experiments) + 1)
+        val_helpers = [prev_stats_full_surrogate_posterior] * 2 + [prev_stats_fixed_surrogate_posterior] * 2
+        (
+            mcmc_times,
+            summaries,
+            X_post,
+            y_post,
+            y_post_hat
+        ) = zip(
+            *[
+                perform_mcmc(
+                    key,
+                    mcmc_helper,
+                    val_helper,
+                    obj,
+                    state
+                )
+                for key, mcmc_helper, val_helper, obj, state
+                in zip(
+                    keys,
+                    [surrogate_posterior_full] * 2 + [surrogate_posterior_fixed] * 2,
+                    val_helpers,
+                    surrogates,
+                    train_states
+                )
+            ]
+        )
 
-    lhs_fixed_mcmc = surrogate_posterior_fixed(surrogate_lhs_fixed, params_lhs_fixed, key)
-    X_post_lhs_fixed = lhs_fixed_mcmc.get_samples()
-    y_post_lhs_fixed = prev_stats_batch(X_post_lhs_fixed)
-    y_post_lhs_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed, X_post_lhs_fixed)
-
-
-    prior_full_mcmc = surrogate_posterior_full(surrogate_prior_full, params_prior_full, key)
-    X_post_prior_full = prior_full_mcmc.get_samples()
-    y_post_prior_full = prev_stats_batch(X_post_prior_full)
-    y_post_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, params_prior_full, X_post_prior_full)
-
-    prior_fixed_mcmc = surrogate_posterior_fixed(surrogate_prior_fixed, params_prior_fixed, key)
-    X_post_prior_fixed = prior_fixed_mcmc.get_samples()
-    y_post_prior_fixed = prev_stats_batch(X_post_prior_fixed)
-    y_post_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fixed, params_prior_fixed, X_post_prior_fixed)
-
-    y_val_prior_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, sort_dict(without_obs(prior)))
-    y_val_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed, sort_dict(without_obs(prior)))
-
-    y_val_lhs_full_hat = prev_stats_surrogate_batch(surrogate_lhs_full, params_lhs_full, X_val_lhs)
-    y_val_lhs_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_lhs_fixed, params_lhs_fixed, X_val_lhs)
-
-    y_val_prior_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, params_prior_full, sort_dict(without_obs(prior)))
-    y_val_prior_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fixed, params_prior_fixed, sort_dict(without_obs(prior)))
-
-    y_val_lhs_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, params_prior_full, X_val_lhs)
-    y_val_lhs_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fixed, params_prior_fixed, X_val_lhs)
-
-    approximation_error(
-        ['lhs_full'] * 3 + ['lhs_fixed'] * 3 + ['prior_full'] * 3 + ['prior_fixed'] * 3,
-        ['prior', 'lhs', 'posterior'] * 4,
-        [y_val_prior, y_val_lhs, y_post_lhs_full, y_val_prior, y_val_lhs, y_post_lhs_fixed, y_val_prior, y_val_lhs, y_post_prior_full, y_val_prior, y_val_lhs, y_post_prior_fixed],
-        [y_val_prior_full_hat, y_val_lhs_full_hat, y_post_lhs_full_hat, y_val_prior_fixed_hat, y_val_lhs_fixed_hat, y_post_lhs_fixed_hat,
-         y_val_prior_prior_full_hat, y_val_lhs_prior_full_hat, y_post_prior_full_hat, y_val_prior_prior_fixed_hat, y_val_lhs_prior_fixed_hat, y_post_prior_fixed_hat]
-    ).to_csv(f'{train_samples}_approx_error.csv', index=False)
-    
-    from scipy.stats import ks_2samp
-    sample_keys = list(posterior_samples.keys())
-    ks_data = pd.DataFrame([
-        {'experiment': name, 'variable': k, 'statistic': ks_2samp(posterior_samples[k], posterior[k]).statistic, 'p-value': ks_2samp(posterior_samples[k], posterior[k]).pvalue}
-        for k in sample_keys
-        for name, posterior in [
-            ('prior_fixed', prior_fixed_mcmc.get_samples()),
-            ('prior_full', prior_full_mcmc.get_samples()),
-            ('lhs_fixed', lhs_fixed_mcmc.get_samples()),
-            ('lhs_full', lhs_full_mcmc.get_samples())
+        logger.info('Calculating validation data')
+        y_val = [
+            helper(
+                surrogate,
+                net,
+                state.params,
+                without_obs(prior)
+            )
+            for helper, (surrogate, net), state
+            in zip(val_helpers, surrogates, train_states)
         ]
-    ]).to_csv(f'{train_samples}_ks_error.csv', index=False)
+
+        logger.info('Writing results')
+        approximation_error(
+            [exp for exp in experiments for _ in range(2)],
+            ['prior', 'posterior'] * len(experiments),
+            [truth for pair in zip([y_val_prior] * len(experiments), y_post) for truth in pair],
+            [hat for pair in zip(y_val, y_post_hat) for hat in pair]
+        ).to_csv(f'{train_samples}_round_{r}_approx_error.csv', index=False)
+
+        mspe(
+            key,
+            experiments,
+            X_post
+        ).to_csv(f'{train_samples}_round_{r}_mspe.csv', index=False)
+
+        pd.DataFrame({
+            'experiment': experiments,
+            'sampling': [t_sample_prior, t_sample_prior, t_sample_lhs, t_sample_lhs],
+            'training': train_times,
+            'mcmc': mcmc_times
+        }).to_csv(f'{train_samples}_round_{r}_timings.csv', index=False)
+
+        sample_keys = list(posterior_samples.keys())
+        pd.DataFrame([
+            {
+                'experiment': name,
+                'variable': k,
+                'statistic': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(posterior[k], -1)).statistic,
+                'p-value': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(posterior[k], -1)).pvalue
+            }
+            for k in sample_keys
+            for name, posterior in zip(experiments, X_post)
+        ]).to_csv(f'{train_samples}_round_{r}_ks_error.csv', index=False)
+
+        pd.concat([
+            s.assign(experiment=name)
+            for name, s in zip(experiments, summaries)
+        ]).to_csv(f'{train_samples}_round_{r}_mcmc_summary.csv', index=False)
+
+        if r != n_rounds - 1:
+            logger.info('Concatting samples')
+            new_samples = [
+                sample_full_from_posterior(X)
+                for X in X_post[:2]
+            ] + [
+                sample_fixed_from_posterior(X)
+                for X in X_post[2:]
+            ]
+            samples = [
+                (
+                    tree_map(lambda *x: jnp.concatenate(x), X, X_new),
+                    tree_map(lambda *y: jnp.concatenate(y), y, y_new),
+                )
+                for ((X, y), (X_new, y_new))
+                in zip(samples, new_samples)
+            ]
     
-for n_batches in jnp.linspace(int(10), int(5e3), num=10, dtype=jnp.int64):
+for n_batches in jnp.linspace(int(10), int(5e3), num=5, dtype=jnp.int64):
     train_samples = n_batches * 100
-    try:
-        run_pipeline(train_samples, key)
-    except Exception as e:
-        print(train_samples)
-        print(e)
-        pass
+    logger.info(f'{train_samples} samples')
+    run_pipeline(train_samples, key)

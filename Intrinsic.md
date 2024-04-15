@@ -20,12 +20,14 @@ import matplotlib.pyplot as plt
 import jax.numpy as jnp
 from jax import random, jit, vmap
 import jax
+jax.config.update('jax_enable_x64', True)
+
 cpu_device = jax.devices('cpu')[0]
 gpu_device = jax.devices('gpu')[0]
 ```
 
 ```{code-cell} ipython3
-n_chains = 10
+n_chains = 4
 ```
 
 ```{code-cell} ipython3
@@ -88,15 +90,19 @@ prev_stats_multisite = vmap(
 
 ```{code-cell} ipython3
 EIRs = jnp.array([0.05, 3.9, 15., 20., 100., 150., 418.])
+n_sites = len(EIRs)
 key, key_i = random.split(key)
 etas = 1. / random.uniform(key_i, shape=(n_sites,), minval=40*365, maxval=100*365, dtype=jnp.float64)
-n_sites = len(EIRs)
 ```
 
 ```{code-cell} ipython3
-def weak_model(true_EIR=None, prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
+def weak_model(
+    true_EIRs=None,
+    prev=None,
+    inc=None,
+    impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
     with numpyro.plate('sites', n_sites):
-        EIR = numpyro.sample('EIR', dist.Uniform(0., 500.), obs=true_EIR)
+        EIR = numpyro.sample('EIR', dist.Uniform(0., 500.), obs=true_EIRs)
     
     # Pre-erythrocytic immunity
     kb = numpyro.sample('kb', dist.Uniform(0., 10.))
@@ -152,7 +158,7 @@ def weak_model(true_EIR=None, prev=None, inc=None, impl=lambda p, e, a: prev_sta
         'obs_prev',
         dist.Independent(
             dist.Binomial(total_count=prev_N, probs=prev_stats, validate_args=True),
-            1
+            2
         ),
         obs=prev
     )
@@ -161,41 +167,45 @@ def weak_model(true_EIR=None, prev=None, inc=None, impl=lambda p, e, a: prev_sta
         'obs_inc',
         dist.Independent(
             dist.Poisson(rate=jnp.maximum(inc_stats * person_risk_time, 1e-12)),
-            1
+            2
         ),
         obs=inc
     )
 ```
 
 ```{code-cell} ipython3
-def model(true_EIR=None, prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
+def model(
+    true_EIRs=None,
+    prev=None,
+    inc=None,
+    impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
     with numpyro.plate('sites', n_sites):
-        EIR = numpyro.sample('EIR', dist.Uniform(0., 500.), obs=true_EIR)
+        EIR = numpyro.sample('EIR', dist.Uniform(0., 500.), obs=true_EIRs)
     
     # Pre-erythrocytic immunity
-    kb = numpyro.sample('kb', dist.LogNormal(0., .1))
+    kb = numpyro.sample('kb', dist.LogNormal(0., .25))
     ub = numpyro.sample('ub', dist.LogNormal(0., 1.))
-    b0 = numpyro.sample('b0', dist.Beta(5., 1.))
-    IB0 = numpyro.sample('IB0', dist.LeftTruncatedDistribution(dist.Cauchy(100., 10.), low=0.))
+    b0 = numpyro.sample('b0', dist.Beta(1., 1.))
+    IB0 = numpyro.sample('IB0', dist.TruncatedDistribution(dist.Normal(50., 20.), low=25., high=75.))
     
     # Clinical immunity
-    kc = numpyro.sample('kc', dist.LogNormal(0., .1))
+    kc = numpyro.sample('kc', dist.LogNormal(0., .25))
     uc = numpyro.sample('uc', dist.LogNormal(0., 1.))
-    phi0 = numpyro.sample('phi0', dist.Beta(5., 1.))
-    phi1 = numpyro.sample('phi1', dist.Beta(1., 2.))
-    IC0 = numpyro.sample('IC0',dist.LeftTruncatedDistribution(dist.Cauchy(100., 10.), low=0.))
+    phi0 = numpyro.sample('phi0', dist.Beta(2., 1.))
+    phi1 = numpyro.sample('phi1', dist.Beta(1., 5.))
+    IC0 = numpyro.sample('IC0', dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.))
     PM = numpyro.sample('PM', dist.Beta(1., 1.))
-    dm = numpyro.sample('dm', dist.LeftTruncatedDistribution(dist.Cauchy(200., 10.), low=0.))
+    dm = numpyro.sample('dm', dist.TruncatedDistribution(dist.Normal(50., 20.), low=5., high=100.))
     
     # Detection immunity
-    kd = numpyro.sample('kd', dist.LogNormal(0., .1))
+    kd = numpyro.sample('kd', dist.LogNormal(0., .25))
     ud = numpyro.sample('ud', dist.LogNormal(0., 1.))
-    d1 = numpyro.sample('d1', dist.Beta(1., 2.))
-    ID0 = numpyro.sample('ID0', dist.LeftTruncatedDistribution(dist.Cauchy(25., 1.), low=0.))
+    d1 = numpyro.sample('d1', dist.Beta(1., 1.))
+    ID0 = numpyro.sample('ID0', dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.))
     fd0 = numpyro.sample('fd0', dist.Beta(1., 1.))
-    gd = numpyro.sample('gd', dist.LogNormal(0., .1))
+    gd = numpyro.sample('gd', dist.LogNormal(0., 2.))
     ad0 = numpyro.sample('ad0', dist.TruncatedDistribution(
-            dist.Cauchy(70. * 365., 365.),
+            dist.Normal(70. * 365., 365.),
             low=40. * 365.,
             high=100. * 365.
         )
@@ -248,7 +258,7 @@ def model(true_EIR=None, prev=None, inc=None, impl=lambda p, e, a: prev_stats_mu
 
 ```{code-cell} ipython3
 key, key_i = random.split(key)
-true_values = Predictive(model, num_samples=1)(key_i, true_EIR=EIRs)
+true_values = Predictive(model, num_samples=1)(key_i, true_EIRs=EIRs)
 ```
 
 ```{code-cell} ipython3
@@ -256,10 +266,25 @@ obs_inc, obs_prev = (true_values['obs_inc'], true_values['obs_prev'])
 ```
 
 ```{code-cell} ipython3
+columns = ['EIR', 'eta', 'prev_2_10', 'prev_10+', 'inc_0_5', 'inc_5_15', 'inc_15+']
+styles = {
+    'EIR': '{}',
+    'eta': None,
+    'prev_2_10':'{:.0f}',
+    'prev_10+': '{:.0f}',
+    'inc_0_5': '{:.0f}',
+    'inc_5_15': '{:.0f}',
+    'inc_15+': '{:.0f}'
+}
 print(pd.DataFrame(
-    jnp.vstack([EIRs, etas, obs_prev.reshape((len(EIRs), 2)).T, obs_inc.reshape((len(EIRs), 3)).T]).T,
-    columns=['EIR', 'eta', 'prev_2_10', 'prev_10+', 'inc_0_5', 'inc_5_15', 'inc_15+']
-).to_latex(index=False))
+    jnp.vstack([
+        EIRs,
+        etas,
+        obs_prev.reshape((len(EIRs), 2)).T,
+        obs_inc.reshape((len(EIRs), 3)).T
+    ]).T,
+    columns=columns
+).style.format(styles).hide(axis="index").to_latex())
 ```
 
 ```{code-cell} ipython3
@@ -298,12 +323,24 @@ def densities(p, model):
 
 ```{code-cell} ipython3
 with jax.default_device(cpu_device):
-    sensitivity = vmap(jacfwd(densities), in_axes=[tree_map(lambda _: 0, without_obs(prior)), None])(without_obs(prior), model)
+    sensitivity = vmap(
+        jacfwd(densities),
+        in_axes=[
+            tree_map(lambda _: 0, without_obs(prior)),
+            None
+        ]
+    )(without_obs(prior), model)
 ```
 
 ```{code-cell} ipython3
 with jax.default_device(cpu_device):
-    weak_sensitivity = vmap(jacfwd(densities), in_axes=[tree_map(lambda _: 0, without_obs(weak_prior)), None])(without_obs(weak_prior), weak_model)
+    weak_sensitivity = vmap(
+        jacfwd(densities),
+        in_axes=[
+            tree_map(lambda _: 0, without_obs(weak_prior)),
+            None
+        ]
+    )(without_obs(weak_prior), weak_model)
 ```
 
 ```{code-cell} ipython3
@@ -320,14 +357,17 @@ sensitivity_df = pd.concat([
     for parameter in sensitivity[0].keys()
     if parameter != 'EIR'
 ])
+```
+
+```{code-cell} ipython3
 sensitivity_age_group_df = pd.concat([
     pd.DataFrame({
         'EIR': float(EIRs[j]),
         'eta': float(etas[j]),
         'age_group': age_group,
         'parameter': parameter,
-        'gradient': sensitivity[i+1][parameter][:, j, a_i]}
-    )
+        'gradient': sensitivity[i+1][parameter][:, 0, j, a_i]
+    })
     for j in range(len(EIRs))
     for i, prev in enumerate(['prev', 'inc'])
     for a_i, age_group in enumerate(age_groups[i])
@@ -373,7 +413,7 @@ norm = plt.Normalize(sensitivity_age_group_df.EIR.min(), sensitivity_age_group_d
 sm = plt.cm.ScalarMappable(cmap="Reds", norm=norm)
 fig, ax = plt.subplots(figsize=(19.7, 8.27))
 sns.barplot(
-    sensitivity_age_group_df,
+    sensitivity_age_group_df.assign(EIR=sensitivity_age_group_df.EIR.astype(str)),
     x='parameter',
     y='gradient',
     hue='EIR',
@@ -594,11 +634,11 @@ n_samples = 100
 n_warmup = 100
 
 mcmc = MCMC(
-    NUTS(model),
+    NUTS(model, forward_mode_differentiation=True),
     num_samples=n_samples,
     num_warmup=n_warmup,
     num_chains=n_chains,
-    chain_method='parallel'
+    chain_method='vectorized'
 )
 mcmc.run(key, None, obs_prev, obs_inc)
 mcmc.print_summary(prob=0.7)
@@ -624,8 +664,8 @@ pyro_data = az.from_numpyro(
 az.rcParams["plot.max_subplots"] = 200
 keys = list(pyro_data.prior.data_vars.keys())
 axs = az.plot_dist_comparison(pyro_data)
-for i, key in enumerate(keys):
-    if key == 'EIR':
+for i, k in enumerate(keys):
+    if k == 'EIR':
         for j in range(n_sites):
             axs[j, 2].vlines(
                 EIRs[j],
@@ -637,7 +677,7 @@ for i, key in enumerate(keys):
     else:
         j = i + n_sites - 1
         axs[j, 2].vlines(
-            true_values[key][0],
+            true_values[k][0],
             0,
             axs[j, 2].get_ylim()[1],
             color = 'red',
@@ -708,13 +748,13 @@ fig.text(0.5, 1, 'Posterior pos_M/inc function', ha='center')
 
 ```{code-cell} ipython3
 weak_mcmc = MCMC(
-    NUTS(weak_model),
+    NUTS(weak_model, forward_mode_differentiation=True),
     num_samples=n_samples,
     num_warmup=n_warmup,
     num_chains=n_chains,
-    chain_method='parallel'
+    chain_method='vectorized'
 )
-weak_mcmc.run(key, obs_prev, obs_inc)
+weak_mcmc.run(key, None, obs_prev, obs_inc)
 weak_mcmc.print_summary(prob=0.7)
 ```
 
@@ -723,27 +763,13 @@ weak_posterior_samples = weak_mcmc.get_samples()
 weak_posterior_predictive = Predictive(
     weak_model,
     weak_posterior_samples
-)(key, obs_prev, obs_inc)
+)(key_i)
 
 weak_pyro_data = az.from_numpyro(
     weak_mcmc,
     prior=weak_prior,
     posterior_predictive=weak_posterior_predictive
 )
-```
-
-```{code-cell} ipython3
-az.rcParams["plot.max_subplots"] = 200
-keys = list(pyro_data.prior.data_vars.keys())
-axs = az.plot_dist_comparison(weak_pyro_data)
-for i in range(axs.shape[0]):
-    axs[i, 2].vlines(
-        true_values[keys[i]][0],
-        0,
-        axs[i, 2].get_ylim()[1],
-        color = 'red',
-        linestyle = 'dashed'
-    )
 ```
 
 ```{code-cell} ipython3
@@ -789,9 +815,12 @@ fig.text(0.5, 1, 'Weak Posterior pos_M/inc function', ha='center')
 ```
 
 ```{code-cell} ipython3
+def wo_EIR(samples):
+    return {k: v for k, v in samples.items() if k != 'EIR'}
+
 posterior_df = pd.concat([
-    pd.DataFrame(posterior_samples).assign(priors='tuned'),
-    #pd.DataFrame(weak_posterior_samples).assign(priors='weak')
+    pd.DataFrame(wo_EIR(posterior_samples)).assign(priors='tuned'),
+    pd.DataFrame(wo_EIR(weak_posterior_samples)).assign(priors='weak')
 ])
 ```
 
@@ -815,7 +844,7 @@ from numpyro.diagnostics import summary
 print(pd.concat([
     pd.DataFrame.from_dict(summary(weak_mcmc.get_samples(group_by_chain=True)), orient='index'),
     pd.DataFrame.from_dict(summary(mcmc.get_samples(group_by_chain=True)), orient='index'),
-    pd.DataFrame.from_dict(without_obs(true_values), orient='index', columns=['value']),
+    pd.DataFrame.from_dict(wo_EIR(without_obs(true_values)), orient='index', columns=['value']),
 ], axis=1, keys=['weak', 'tuned', 'latent']).loc[[
         # Pre-erythrocytic immunity
     'kb',
@@ -845,43 +874,44 @@ print(pd.concat([
 ```
 
 ```{code-cell} ipython3
-(
-    jnp.sum(obs_inc - weak_posterior_predictive['obs_inc'] > 0),
-    jnp.sum(obs_prev - weak_posterior_predictive['obs_prev'] > 0)
-)
-```
-
-```{code-cell} ipython3
-fig, axs = plt.subplots(5, len(EIRs), figsize=(50, 80))
-n_post = posterior_predictive['obs_prev'].shape[0]
-
-pp = jnp.concatenate([posterior_predictive['obs_prev'], posterior_predictive['obs_inc']], axis=2)
-obs = jnp.concatenate([obs_prev, obs_inc], axis=2)
-
-for i, e in enumerate(EIRs):
-    for j, a in enumerate(['prev_2_10', 'prev_10+','inc_0_5', 'inc_5_15', 'inc_15+']):
-        axs[0, i].set_xlabel(
-            f'EIR: {e}'
+prev_columns = ['prev_2_10', 'prev_10+']
+inc_columns = ['inc_0_5', 'inc_5_15', 'inc_15+']
+mspe = pd.concat([
+    pd.concat([
+        pd.DataFrame(
+            jnp.mean(jnp.square(obs_inc - posterior_predictive['obs_inc']), axis=0),
+            columns=inc_columns
+        ).assign(priors='tuned', EIR=EIRs),
+        pd.DataFrame(
+            jnp.mean(jnp.square(obs_inc - weak_posterior_predictive['obs_inc']), axis=0),
+            columns=inc_columns
+        ).assign(priors='weak', EIR=EIRs)
+    ]),
+    pd.concat([
+        pd.DataFrame(
+            jnp.mean(jnp.square(obs_prev - posterior_predictive['obs_prev']), axis=0),
+            columns=prev_columns
+        ),
+        pd.DataFrame(
+            jnp.mean(jnp.square(obs_prev - weak_posterior_predictive['obs_prev']), axis=0),
+            columns=prev_columns
         )
-        axs[0, i].xaxis.set_label_position('top')
-        axs[j, 0].set_ylabel(a)
-        axs[j, i].hist(pp[:, i, j])
-        axs[j, i].vlines(
-            obs[0, i, j],
-            0,
-            axs[j, i].get_ylim()[1],
-            color = 'red',
-            linestyle = 'dashed'
-        )
+    ])
+], axis=1)
 ```
 
 ```{code-cell} ipython3
-(
-    jnp.mean(obs_inc - posterior_predictive['obs_inc']),
-    jnp.mean(obs_prev - posterior_predictive['obs_prev'])
-)
+print(mspe.pivot(index='EIR', columns='priors').style.format('{:.3f}').to_latex())#.sort_index(axis=1, level=0)
 ```
 
 ```{code-cell} ipython3
+import pickle
+```
 
+```{code-cell} ipython3
+with open('./intinsic_mcmc_tuned.pkl', 'wb') as f:
+    pickle.dump(mcmc, f)
+
+with open('./intinsic_mcmc_weak.pkl', 'wb') as f:
+    pickle.dump(weak_mcmc, f)
 ```

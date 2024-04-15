@@ -14,7 +14,7 @@ kernelspec:
 
 # TODO
 
- * Properly sample truncated normal
+ * Low EIR issue?
  * Implement in mox
    * History matching many rounds
    * History matching from sample
@@ -176,9 +176,11 @@ prior_train_space = [
         'rU': DistStrategy(dist.LogNormal(0., 1.))
     },
     #DistStrategy(dist.TruncatedNormal(est_EIR, noise, low=0., high=500))
-    DistStrategy(SiteDistribution({'EIR': est_EIR, 'etas': etas}, noise))
-    #DistStrategy(dist.Uniform(jnp.zeros((n_sites,)), jnp.full((n_sites,), 500.))), # EIR
-    #DistStrategy(dist.Uniform(jnp.full((n_sites,), 1/(100 * 365)), jnp.full((n_sites,), 1/(40 * 365)))) # eta
+    #DistStrategy(dist.Uniform(0., 500.)), # EIR
+    #DistStrategy(SiteDistribution({'EIR': est_EIR, 'etas': etas}, noise))
+    #DistStrategy(dist.Uniform(1/(100 * 365), 1/(40 * 365))) # eta
+    DistStrategy(dist.Uniform(jnp.zeros((n_sites,)), jnp.full((n_sites,), 500.))), # EIR
+    DistStrategy(dist.Uniform(jnp.full((n_sites,), 1/(100 * 365)), jnp.full((n_sites,), 1/(40 * 365)))) # eta
 ]
 
 prior_test_space = [
@@ -323,7 +325,7 @@ import jax
 import pandas as pd
 from scipy.stats.qmc import LatinHypercube
 
-train_samples = int(1e5)
+train_samples = int(1e4)
 device_count = len(jax.devices())
 ```
 
@@ -361,9 +363,9 @@ lhs_train_space = [
         name: LHSStrategy(lower, upper)
         for name, lower, upper in intrinsic_bounds.itertuples(index=False)
     },
-    DistStrategy(SiteDistribution({'EIR': est_EIR, 'etas': etas}, noise))
-    #LHSStrategy(0., 500.),
-    #LHSStrategy(1/(100 * 365), 1/(40 * 365))
+    #DistStrategy(SiteDistribution({'EIR': est_EIR, 'etas': etas}, noise))
+    LHSStrategy(0., 500.),
+    LHSStrategy(1/(100 * 365), 1/(40 * 365))
     #LHSStrategy(jnp.full((n_sites,), 0.), jnp.full((n_sites,), 500.)),
     #LHSStrategy(jnp.full((n_sites,), 1/(100 * 365)), jnp.full((n_sites,), 1/(40 * 365)))
 ]
@@ -435,7 +437,7 @@ key_i, key = random.split(key)
 with jax.default_device(cpu_device):
     X_prior_full = sample(prior_train_space, train_samples, key_i)
     #X_prior_full = [X_prior_full[0], X_prior_full[1]['EIR'], X_prior_full[1]['etas']]
-    X_prior_full = X_prior_full + [jnp.repeat(etas[None, :], train_samples, axis=0)]
+    #X_prior_full = X_prior_full + [jnp.repeat(etas[None, :], train_samples, axis=0)]
     y_prior_full = vmap(vmap(full_solution, in_axes=[None, 0, 0]), in_axes=tree_map(lambda x: 0, X_prior_full))(*X_prior_full)
 ```
 
@@ -486,11 +488,24 @@ def limit(x, x_min, x_max):
         x_max
     )
     
-def perturb(key, x, x_mean, x_std, x_min, x_max):
-    x_stand = standardise(x, x_mean, x_std)
-    x_peturbed = tree_map(lambda l: l + random.normal(key, shape=l.shape), x_stand)
-    x_new = inverse_standardise(x_peturbed, x_mean, x_std)
-    x_new = limit(x, x_min, x_max)
+def perturb(key, x, x_mean, x_std, x_min, x_max, alpha=1.):
+    x_std_alpha = tree_map(lambda x: x * alpha, x_std)
+    x_stand = standardise(x, x_mean, x_std_alpha)
+    x_min_stand = standardise(x_min, x, x_std_alpha)
+    x_max_stand = standardise(x_max, x, x_std_alpha)
+    x_peturbed = tree_map(
+        lambda l, lower, upper: l + random.truncated_normal(
+            key,
+            lower=lower,
+            upper=upper,
+            shape=l.shape
+        ),
+        x_stand,
+        x_min_stand,
+        x_max_stand
+    )
+    x_new = inverse_standardise(x_peturbed, x_mean, x_std_alpha)
+    #x_new = limit(x, x_min, x_max)
     return x_new
 
 #def perturb(key, x, x_mean, x_std, x_min, x_max):
@@ -518,6 +533,10 @@ ip, ip_site = vmap(implausability, in_axes=[tree_map(lambda _: 0, y_prior_full)]
 ```
 
 ```{code-cell} ipython3
+ip = vmap(implausability, in_axes=[tree_map(lambda _: 0, y_prior_full)])(y_prior_full)
+```
+
+```{code-cell} ipython3
 ip, ip_site = vmap(implausability, in_axes=[tree_map(lambda _: 0, y_lhs_full)])(y_lhs_full)
 ```
 
@@ -526,48 +545,159 @@ plt.hist(ip, bins=100)
 ```
 
 ```{code-cell} ipython3
+jnp.min(ip)
+```
+
+```{code-cell} ipython3
 from collections import Counter
 ```
 
 ```{code-cell} ipython3
+cutoff = 3
 Counter([int(i) for i in ip_site[ip < cutoff]])
 ```
 
 ```{code-cell} ipython3
+from mox.utils import tree_to_vector
+```
+
+```{code-cell} ipython3
+x = vmap(tree_to_vector, in_axes=[tree_map(lambda _: 0, X_prior_full)])(X_prior_full)
+```
+
+```{code-cell} ipython3
+x.shape
+```
+
+```{code-cell} ipython3
+from jax import jacfwd, jacrev
+```
+
+```{code-cell} ipython3
+tree_map(lambda x: x.shape, X_prior_full)
+```
+
+```{code-cell} ipython3
+with jax.default_device(cpu_device):
+    dx = jit(vmap(jacrev(jacfwd(lambda x: implausability(vmap(full_solution, in_axes=[None, 0, 0])(*x)))), in_axes=[tree_map(lambda _: 0, X_prior_full)]))(tree_map(lambda x: x[:10], X_prior_full))
+```
+
+```{code-cell} ipython3
+import numpy as np
+```
+
+```{code-cell} ipython3
 n_rounds = 5
-X_hm = X_prior_full.copy()
-y_hm = y_prior_full.copy()
-X_mean = tree_map(jnp.mean, X_hm)
-X_std = tree_map(jnp.std, X_hm)
-cutoff = 3
+X_hm = [X_prior_full.copy()]
+y_hm = [y_prior_full.copy()]
+X_mean = tree_map(jnp.mean, X_hm[0])
+alpha = [1e-3] * 2 + [1e-2] * 3
+cutoff = [3] * 5
 for i in range(n_rounds):
     print(f'round {i}')
-    ip, ip_site = vmap(implausability, in_axes=[tree_map(lambda _: 0, y_hm)])(y_hm)
-        
-    take = ip < cutoff
-    print(jnp.sum(ip < cutoff))
-    counter = Counter([int(i) for i in ip_site[ip < cutoff]])
-    print(counter)
-
-    if i < n_rounds:
+    X_std = tree_map(lambda x: jnp.std(x) * alpha[i], X_hm[0])
+    X_current = tree_map(lambda *a: jnp.concatenate(a), *X_hm)
+    y_current = tree_map(lambda *a: jnp.concatenate(a), *y_hm)
+    ip, ip_site = vmap(implausability, in_axes=[tree_map(lambda _: 0, y_current)])(y_current)
+    c = cutoff[i]
+    take = ip < c
+    counter = Counter(np.array(ip_site))
+    counts = jnp.array([counter[i] for i in range(n_sites)])
+    print('best', jnp.min(ip))
+    print('n_new', jnp.sum(take))
+    print('acceptance', 1. * jnp.sum(take) / ip.shape[0])
+    print('site dist', counts / ip.shape[0])
+    if i < n_rounds - 1:
         with jax.default_device(cpu_device):
             key_i, key = random.split(key)
             next_index = random.choice(
                 key_i,
                 jnp.sum(take),
                 (train_samples,),
-                p=1/jnp.array([counter[int(i)] for i in ip_site[take]])
+                p=1./counts[ip_site[take]]
             )
-            X_next = tree_map(lambda l: l[take][next_index], X_hm)
+            X_next = tree_map(lambda l: l[take][next_index], X_current)
             next_etas = X_next[-1]
             X_next = perturb(key_i, X_next[:-1], X_mean[:-1], X_std[:-1], x_min[:-1], x_max[:-1]) + [next_etas]
             y_next = vmap(full_solution, in_axes=tree_map(lambda _: 0, X_next))(*X_next)
-            X_hm = combine(X_hm, X_next)
-            y_hm = combine(y_hm, y_next)
+            X_hm.append(X_next)
+            y_hm.append(y_next)
 ```
 
 ```{code-cell} ipython3
-tree_map(lambda x, y: jnp.sum(x == y), X_hm, x_max)
+plt.hist(ip, bins=100)
+```
+
+```{code-cell} ipython3
+jnp.min(ip)
+```
+
+```{code-cell} ipython3
+n_rounds = 5
+X_hm = [X_prior_full.copy()]
+y_hm = [y_prior_full.copy()]
+X_mean = tree_map(jnp.mean, X_hm[0])
+X_std = tree_map(jnp.std, X_hm[0])
+alpha = [1] * 2 + [1] * 3
+cutoff = [50] * 2 + [3] * 3
+for i in range(n_rounds):
+    print(f'round {i}')
+    X_current = tree_map(lambda *a: jnp.concatenate(a), *X_hm)
+    y_current = tree_map(lambda *a: jnp.concatenate(a), *y_hm)
+    ip = vmap(implausability, in_axes=[tree_map(lambda _: 0, y_current)])(y_current)
+    c = cutoff[i]
+    take = ip < c
+    print('best', jnp.min(ip))
+    print('n_new', jnp.sum(take))
+    print('acceptance', 1. * jnp.sum(take) / ip.shape[0])
+
+    if i < n_rounds - 1:
+        with jax.default_device(cpu_device):
+            key_i, key = random.split(key)
+            next_index = random.choice(
+                key_i,
+                jnp.sum(take),
+                (train_samples,)
+            )
+            X_next = tree_map(lambda l: l[take][next_index], X_current)
+            next_etas = X_next[-1]
+            X_next = perturb(key_i, X_next[:-1], X_mean[:-1], X_std[:-1], x_min[:-1], x_max[:-1], alpha=1.) + [next_etas]
+            y_next = vmap(vmap(full_solution, in_axes=[None, 0, 0]), in_axes=tree_map(lambda _: 0, X_next))(*X_next)
+            X_hm.append(X_next)
+            y_hm.append(y_next)
+```
+
+```{code-cell} ipython3
+jnp.sum(take)
+```
+
+```{code-cell} ipython3
+ip.shape
+```
+
+```{code-cell} ipython3
+plt.hist(X_current[1][X_current[1] < .1])
+```
+
+```{code-cell} ipython3
+def parameters_to_dataframe(X):
+    return pd.DataFrame({**X[0], 'EIR': X[1], 'eta': X[2]}).melt()
+```
+
+```{code-cell} ipython3
+df = pd.concat([parameters_to_dataframe(p).assign(round = i) for i, p in enumerate(X_hm)])
+```
+
+```{code-cell} ipython3
+import seaborn as sns
+```
+
+```{code-cell} ipython3
+sns.histplot(df[df.variable == 'EIR'], x='value', hue='round', bins='sturges')
+```
+
+```{code-cell} ipython3
+sns.histplot(df[df.variable == 'kd'], x='value', hue='round', bins='sturges')
 ```
 
 ```{code-cell} ipython3
@@ -612,18 +742,18 @@ def prev_stats_batch(params):
 
 ```{code-cell} ipython3
 surrogate_hm = make_surrogate(
-    X_hm,
-    y_hm,
+    X_current,
+    y_current,
     y_min=y_min_full,
     y_max=y_max_full,
     dropout_rate=.2,
     batch_norm=False
 )
 key_i, key = random.split(key)
-variables = pytree_init(key_i, surrogate_hm, _freeze_attr(X_hm))
+variables = pytree_init(key_i, surrogate_hm, _freeze_attr(X_current))
 hm_state = train_surrogate(
-    X_hm,
-    y_hm,
+    X_current,
+    y_current,
     surrogate_hm,
     mse,
     key_i,
@@ -1009,6 +1139,10 @@ approximation_error(
 ```
 
 ```{code-cell} ipython3
+hm_mcmc.print_summary(prob=0.7)
+```
+
+```{code-cell} ipython3
 import pickle
 import os.path
 
@@ -1249,6 +1383,28 @@ posterior_curves_surrogate = get_curves(hm_samples, EIRs, etas)
 ```
 
 ```{code-cell} ipython3
+posterior_curves = get_curves(posterior_samples, EIRs, etas)
+```
+
+```{code-cell} ipython3
+fig, axs = plt.subplots(3, len(EIRs), sharey=True, sharex=True)
+imm_labels = ['b', 'c', 'd']
+for i in range(len(EIRs)):
+    axs[0, i].set_xlabel(
+        f'EIR: {EIRs[i]}'
+    )
+    axs[0, i].xaxis.set_label_position('top')
+    for imm_i, imm in enumerate([f'prob_{l}' for l in imm_labels]):
+        axs[imm_i, i].plot(posterior_curves[imm][i, :n_curves, :].T, color='r', alpha=.01)
+        axs[imm_i, i].plot(true_curves[imm][i, 0, :].T)
+        axs[imm_i, 0].set_ylabel(f'prob. {imm_labels[imm_i]}')
+        
+fig.tight_layout()
+fig.text(0.5, 0, 'Age (years)', ha='center')
+fig.text(0.5, 1, 'Posterior immunity probability function', ha='center')
+```
+
+```{code-cell} ipython3
 fig, axs = plt.subplots(3, len(EIRs), sharey=True, sharex=True)
 imm_labels = ['b', 'c', 'd']
 for i in range(len(EIRs)):
@@ -1264,6 +1420,23 @@ for i in range(len(EIRs)):
 fig.tight_layout()
 fig.text(0.5, 0, 'Age (years)', ha='center')
 fig.text(0.5, 1, 'Surrogate posterior immunity probability function', ha='center')
+```
+
+```{code-cell} ipython3
+fig, axs = plt.subplots(2, len(EIRs), sharey='row', sharex=True)
+
+prev_labels = ['pos_M', 'inc']
+for i in range(len(EIRs)):
+    for prev_i, prev in enumerate(prev_labels):
+        axs[0, i].set_xlabel(f'EIR: {EIRs[i]}')
+        axs[0, i].xaxis.set_label_position('top')
+        axs[prev_i, i].plot(posterior_curves[prev][i, :n_curves, :].T / posterior_curves['prop'][i, :n_curves, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(true_curves[prev][i, 0, :] / true_curves['prop'][i, 0, :])
+        axs[prev_i, 0].set_ylabel(prev)
+        
+fig.tight_layout()
+fig.text(0.5, 0, 'Age (years)', ha='center')
+fig.text(0.5, 1, 'Posterior pos_M/inc function', ha='center')
 ```
 
 ```{code-cell} ipython3
