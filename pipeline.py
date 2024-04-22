@@ -11,8 +11,10 @@ from jax import random, jit, vmap
 import dmeq
 from mox.sampling import LHSStrategy
 import numpyro
-from numpyro.infer import MCMC, NUTS, Predictive
+from numpyro.infer import MCMC, NUTS, Predictive, log_likelihood
+from numpyro.infer.util import log_density 
 from numpyro.diagnostics import summary
+from numpyro import handlers
 import numpyro.distributions as dist
 from scipy.stats import ks_2samp
 import arviz as az
@@ -519,7 +521,55 @@ def surrogate_posterior_full(surrogate, net, params, key):
 def surrogate_posterior_fixed(surrogate, net, params, key):
     return surrogate_posterior(key, surrogate_impl_fixed(surrogate, net, params))
 
-val_size = int(1e4)
+from numpyro import optim
+from numpyro.infer import SVI, Trace_ELBO
+from numpyro.infer.autoguide import AutoBNAFNormal
+
+def wo_latent(X):
+    return {
+        k: v
+        for k, v in X.items()
+        if k != '_auto_latent'
+    }
+
+def surrogate_posterior_svi(key, impl):
+    n_samples = 500 * n_chains
+    n_train_samples = 50_000
+    
+    guide = AutoBNAFNormal(model, num_flows=5)
+    svi = SVI(
+        model,
+        guide,
+        optim.ClippedAdam(1e-4),
+        loss=Trace_ELBO(num_particles=8),
+        true_EIRs=None,
+        prev=obs_prev,
+        inc=obs_inc,
+        impl=impl
+    )
+
+    # train SVI
+    sample_key, key = random.split(key, 2)
+    svi_result = svi.run(sample_key, n_train_samples, stable_update=True)
+    svi_params = svi_result.params
+
+    # sample posterior
+    post_key, key = random.split(key, 2)
+    posterior_samples = Predictive(
+        guide,
+        params=svi_params,
+        num_samples=n_samples
+    )(post_key)
+
+    posterior_samples = wo_latent(posterior_samples) 
+
+    return posterior_samples
+
+def surrogate_posterior_full_svi(surrogate, net, params, key):
+    return surrogate_posterior_svi(key, surrogate_impl_full(surrogate, net, params))
+
+def surrogate_posterior_fixed_svi(surrogate, net, params, key):
+    return surrogate_posterior_svi(key, surrogate_impl_fixed(surrogate, net, params))
 
 logger.info('Making validation set')
 y_val_prior = prev_stats_posterior(without_obs(prior))
@@ -544,31 +594,58 @@ def approximation_error(exps, labels, ys, y_hats):
         for exp, label, y, y_hat in zip(exps, labels, ys, y_hats)
     ])
 
-def mspe(key, labels, posteriors):
-    prev_columns = ['prev_2_10', 'prev_10+']
-    inc_columns = ['inc_0_5', 'inc_5_15', 'inc_15+']
-    keys = random.split(key, len(posteriors))
-    posterior_predictives = [
-        Predictive(model, p)(key_i)
-        for key_i, p in zip(keys, posteriors)
+def stand_approximation_error(exps, labels, ys, y_hats, std_surrogate):
+    ys = [
+        vmap(std_surrogate.vectorise_output, in_axes=[tla(y)])(y)
+        for y in ys
     ]
-    return pd.concat([
-        pd.concat([
-            pd.DataFrame(
-                jnp.mean(jnp.square(obs_inc - pp['obs_inc']), axis=0),
-                columns=inc_columns
-            ).assign(EIR=EIRs),
-            pd.DataFrame(
-                jnp.mean(jnp.square(obs_prev - pp['obs_prev']), axis=0),
-                columns=prev_columns
-            ).assign(EIR=EIRs),
-        ], axis=1).assign(experiment=label)
-        for label, pp in zip(labels, posterior_predictives)
+    y_hats = [
+        vmap(std_surrogate.vectorise_output, in_axes=[tla(y_hat)])(y_hat)
+        for y_hat in y_hats
+    ]
+    
+    return pd.DataFrame([
+        {
+            'mse': jnp.mean(jnp.square(y - y_hat)),
+            'test_set': label,
+            'experiment': exp
+        }
+        for exp, label, y, y_hat in zip(exps, labels, ys, y_hats)
     ])
 
 def save_mcmc(name, mcmc):
     with open(f'chapter_2_mcmc_{name}.pkl', 'wb') as f:
         pickle.dump(mcmc, f)
+
+def pp_ll(key, p):
+    pp = Predictive(model, p)(key)
+    _t = {
+        k: v[0] if k == 'EIR' else v
+        for k, v in without_obs(true_values).items()
+    }
+    ld = log_density(handlers.seed(model, key), [], {}, _t)
+    return pd.DataFrame(
+        jnp.concatenate(
+            [
+                jnp.mean(ld[1]['obs_prev']['fn'].base_dist.log_prob(pp['obs_prev']), axis=0),
+                jnp.mean(ld[1]['obs_inc']['fn'].base_dist.log_prob(pp['obs_inc']), axis=0)
+            ],
+            axis=1
+        ),
+        columns=['prev_2_10', 'prev_10+', 'inc_0_5', 'inc_5_15', 'inc_15+']
+    ).assign(EIR=EIRs)
+
+def pp_ll_df(key, ps, labels):
+    return pd.concat([
+        pp_ll(key, p).assign(experiment=l)
+        for p, l in zip(ps, labels)
+    ])
+
+def ll_df(X_post, labels):
+    return pd.DataFrame([
+        tree_map(jnp.mean, log_likelihood(model, X, prev=obs_prev, inc=obs_inc))
+        for X in X_post
+    ]).assign(experiments=labels)
 
 n_samples = 100
 n_warmup = 100
@@ -593,12 +670,18 @@ else:
 
 mcmc.print_summary(prob=0.7)
 posterior_samples = mcmc.get_samples()
-logger.info('Writing underlying mspe')
-mspe(
+logger.info('Writing underlying ll')
+
+pp_ll_df(
     key_i,
-    ['underlying'],
-    [posterior_samples]
-).to_csv(f'underlying_mspe.csv', index=False)
+    [posterior_samples],
+    ['underlying']
+).to_csv(f'underlying_pp_ll.csv', index=False)
+
+ll_df(
+    [posterior_samples],
+    ['underlying']
+).to_csv(f'underlying_ll.csv', index=False)
 logger.info('done')
 
 def make_surrogate_objects(samples, y_min, y_max):
@@ -611,7 +694,6 @@ def make_surrogate_objects(samples, y_min, y_max):
     )
     net = make_net(surrogate, y)
     return surrogate, net
-
 
 def train_surrogate_objects(key, surrogate_obj, samples):
     surrogate, net = surrogate_obj
@@ -656,11 +738,33 @@ def perform_mcmc(key, mcmc_helper, val_helper, obj, train_state):
         y_post_hat
     )
 
+def perform_svi(key, svi_helper, val_helper, obj, train_state):
+    surrogate, net = obj
+    t, X_post = timing(svi_helper)(
+        surrogate,
+        net,
+        train_state.params,
+        key
+    )
+    y_post = prev_stats_posterior(X_post)
+    y_post_hat = val_helper(
+        surrogate,
+        net,
+        train_state.params,
+        X_post
+    )
+    return (
+        t,
+        X_post,
+        y_post,
+        y_post_hat
+    )
+
 def run_pipeline(train_samples, key):
     experiments = [
         'lhs_full',
-        'lhs_fixed',
         'prior_full',
+        'lhs_fixed',
         'prior_fixed'
     ]
 
@@ -689,6 +793,8 @@ def run_pipeline(train_samples, key):
         (X_prior_fixed, y_prior_fixed)
     ]
 
+    samples_mcmc = samples_svi = samples
+
     logger.info('Making surrogates')
 
     surrogates = [
@@ -700,23 +806,38 @@ def run_pipeline(train_samples, key):
     ]
 
     for r in range(n_rounds):
-        if os.path.exists(f'{train_samples}_round_{r}_approx_error.csv'):
+        if os.path.exists(f'{train_samples}_round_{r}_ll.csv'):
             continue
 
         logger.info(f'Training surrogates: round {r}')
         key, *keys = random.split(key, len(experiments) + 1)
 
-        train_times, train_states = zip(
+        train_times, train_states_mcmc = zip(
             *[
                 train_surrogate_objects(key, obj, s)
                 for key, obj, s
                 in zip(
                     keys,
                     surrogates,
-                    samples
+                    samples_mcmc
                 )
             ]
         )
+
+        if r == 0:
+            train_states_svi = train_states_mcmc
+        else:
+            _, train_states_svi = zip(
+                *[
+                    train_surrogate_objects(key, obj, s)
+                    for key, obj, s
+                    in zip(
+                        keys,
+                        surrogates,
+                        samples_svi
+                    )
+                ]
+            )
 
         logger.info('Performing MCMC')
         key, *keys = random.split(key, len(experiments) + 1)
@@ -742,13 +863,40 @@ def run_pipeline(train_samples, key):
                     [surrogate_posterior_full] * 2 + [surrogate_posterior_fixed] * 2,
                     val_helpers,
                     surrogates,
-                    train_states
+                    train_states_mcmc
+                )
+            ]
+        )
+
+        logger.info('Performing SVI')
+        key, *keys = random.split(key, len(experiments) + 1)
+        (
+            svi_times,
+            X_post_svi,
+            y_post_svi,
+            y_post_svi_hat
+        ) = zip(
+            *[
+                perform_svi(
+                    key,
+                    svi_helper,
+                    val_helper,
+                    obj,
+                    state
+                )
+                for key, svi_helper, val_helper, obj, state
+                in zip(
+                    keys,
+                    [surrogate_posterior_full_svi] * 2 + [surrogate_posterior_fixed_svi] * 2,
+                    val_helpers,
+                    surrogates,
+                    train_states_svi
                 )
             ]
         )
 
         logger.info('Calculating validation data')
-        y_val = [
+        y_val_mcmc = [
             helper(
                 surrogate,
                 net,
@@ -756,7 +904,18 @@ def run_pipeline(train_samples, key):
                 without_obs(prior)
             )
             for helper, (surrogate, net), state
-            in zip(val_helpers, surrogates, train_states)
+            in zip(val_helpers, surrogates, train_states_mcmc)
+        ]
+
+        y_val_svi = [
+            helper(
+                surrogate,
+                net,
+                state.params,
+                without_obs(prior)
+            )
+            for helper, (surrogate, net), state
+            in zip(val_helpers, surrogates, train_states_svi)
         ]
 
         logger.info('Writing results')
@@ -764,23 +923,65 @@ def run_pipeline(train_samples, key):
             [exp for exp in experiments for _ in range(2)],
             ['prior', 'posterior'] * len(experiments),
             [truth for pair in zip([y_val_prior] * len(experiments), y_post) for truth in pair],
-            [hat for pair in zip(y_val, y_post_hat) for hat in pair]
+            [hat for pair in zip(y_val_mcmc, y_post_hat) for hat in pair]
         ).to_csv(f'{train_samples}_round_{r}_approx_error.csv', index=False)
 
-        mspe(
-            key,
-            experiments,
-            X_post
-        ).to_csv(f'{train_samples}_round_{r}_mspe.csv', index=False)
+        approximation_error(
+            [exp for exp in experiments for _ in range(2)],
+            ['prior', 'posterior'] * len(experiments),
+            [truth for pair in zip([y_val_prior] * len(experiments), y_post_svi) for truth in pair],
+            [hat for pair in zip(y_val_svi, y_post_svi_hat) for hat in pair]
+        ).to_csv(f'{train_samples}_round_{r}_svi_approx_error.csv', index=False)
+
+        stand_approximation_error(
+            [exp for exp in experiments for _ in range(2)],
+            ['prior', 'posterior'] * len(experiments),
+            [truth for pair in zip([y_val_prior] * len(experiments), y_post) for truth in pair],
+            [hat for pair in zip(y_val_mcmc, y_post_hat) for hat in pair],
+            surrogates[2][0] # lhs_fixed surrogate for standardising
+        ).to_csv(f'{train_samples}_round_{r}_stand_approx_error.csv', index=False)
+
+        stand_approximation_error(
+            [exp for exp in experiments for _ in range(2)],
+            ['prior', 'posterior'] * len(experiments),
+            [truth for pair in zip([y_val_prior] * len(experiments), y_post_svi) for truth in pair],
+            [hat for pair in zip(y_val_svi, y_post_svi_hat) for hat in pair],
+            surrogates[2][0] # lhs_fixed surrogate for standardising
+        ).to_csv(f'{train_samples}_round_{r}_svi_stand_approx_error.csv', index=False)
 
         pd.DataFrame({
             'experiment': experiments,
             'sampling': [t_sample_prior, t_sample_prior, t_sample_lhs, t_sample_lhs],
             'training': train_times,
-            'mcmc': mcmc_times
+            'mcmc': mcmc_times,
+            'svi': svi_times 
         }).to_csv(f'{train_samples}_round_{r}_timings.csv', index=False)
 
+        logger.info('Writing likelihoods')
+        pp_ll_df(
+            key_i,
+            X_post,
+            experiments
+        ).to_csv(f'{train_samples}_round_{r}_pp_ll.csv', index=False)
+
+        pp_ll_df(
+            key_i,
+            X_post_svi,
+            experiments
+        ).to_csv(f'{train_samples}_round_{r}_svi_pp_ll.csv', index=False)
+
+        ll_df(
+            X_post,
+            experiments
+        ).to_csv(f'{train_samples}_round_{r}_ll.csv', index=False)
+
+        ll_df(
+            X_post_svi,
+            experiments
+        ).to_csv(f'{train_samples}_round_{r}_svi_ll.csv', index=False)
+
         sample_keys = list(posterior_samples.keys())
+
         pd.DataFrame([
             {
                 'experiment': name,
@@ -792,6 +993,17 @@ def run_pipeline(train_samples, key):
             for name, posterior in zip(experiments, X_post)
         ]).to_csv(f'{train_samples}_round_{r}_ks_error.csv', index=False)
 
+        pd.DataFrame([
+            {
+                'experiment': name,
+                'variable': k,
+                'statistic': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(posterior[k], -1)).statistic,
+                'p-value': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(posterior[k], -1)).pvalue
+            }
+            for k in sample_keys
+            for name, posterior in zip(experiments, X_post_svi)
+        ]).to_csv(f'{train_samples}_round_{r}_svi_ks_error.csv', index=False)
+
         pd.concat([
             s.assign(experiment=name)
             for name, s in zip(experiments, summaries)
@@ -799,23 +1011,39 @@ def run_pipeline(train_samples, key):
 
         if r != n_rounds - 1:
             logger.info('Concatting samples')
-            new_samples = [
+            new_samples_mcmc = [
                 sample_full_from_posterior(X)
                 for X in X_post[:2]
             ] + [
                 sample_fixed_from_posterior(X)
                 for X in X_post[2:]
             ]
-            samples = [
+            samples_mcmc = [
                 (
                     tree_map(lambda *x: jnp.concatenate(x), X, X_new),
                     tree_map(lambda *y: jnp.concatenate(y), y, y_new),
                 )
                 for ((X, y), (X_new, y_new))
-                in zip(samples, new_samples)
+                in zip(samples_mcmc, new_samples_mcmc)
+            ]
+
+            new_samples_svi = [
+                sample_full_from_posterior(X)
+                for X in X_post_svi[:2]
+            ] + [
+                sample_fixed_from_posterior(X)
+                for X in X_post_svi[2:]
+            ]
+            samples_svi = [
+                (
+                    tree_map(lambda *x: jnp.concatenate(x), X, X_new),
+                    tree_map(lambda *y: jnp.concatenate(y), y, y_new),
+                )
+                for ((X, y), (X_new, y_new))
+                in zip(samples_svi, new_samples_svi)
             ]
     
-for n_batches in jnp.linspace(int(10), int(5e3), num=5, dtype=jnp.int64):
+for n_batches in jnp.linspace(int(10), int(1e3), num=5, dtype=jnp.int64):
     train_samples = n_batches * 100
     logger.info(f'{train_samples} samples')
     run_pipeline(train_samples, key)

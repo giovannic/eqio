@@ -14,6 +14,10 @@ kernelspec:
 
 # TODO
 
+ * Standardised mse
+ * Likelihood of pp given true theta
+ * Likelihood of true theta
+ * Bayesian P-value
  * MMD
  * History matching
 
@@ -38,7 +42,7 @@ gpu_device = jax.devices('gpu')[0]
 
 ```{code-cell} ipython3
 import dmeq
-from mox.sampling import LHSStrategy
+from mox.sampling import LHSStrategy, DistStrategy
 ```
 
 ```{code-cell} ipython3
@@ -109,78 +113,11 @@ etas = 1. / random.uniform(key_i, shape=(n_sites,), minval=40*365, maxval=100*36
 ```
 
 ```{code-cell} ipython3
-from mox.sampling import DistStrategy
-```
-
-```{code-cell} ipython3
-# TODO: take this from the model
-# noise = 10.
-# est_EIR = dist.TruncatedNormal(EIRs, noise, low=0., high=500.).sample(key)
-
-prior_train_space = [
-    {
-        'kb': DistStrategy(dist.LogNormal(0., .25)),
-        'ub': DistStrategy(dist.LogNormal(0., 1.)),
-        'b0': DistStrategy(dist.Beta(1., 1.)),
-        'IB0': DistStrategy(dist.TruncatedDistribution(dist.Normal(50., 20.), low=25., high=75.)),
-        'kc': DistStrategy(dist.LogNormal(0., .25)),
-        'uc': DistStrategy(dist.LogNormal(0., 1.)),
-        'IC0': DistStrategy(dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)),
-        'phi0': DistStrategy(dist.Beta(2., 1.)),
-        'phi1': DistStrategy(dist.Beta(1., 5.)),
-        'PM': DistStrategy(dist.Beta(1., 1.)),
-        'dm': DistStrategy(dist.TruncatedDistribution(dist.Normal(50., 20.), low=5., high=100.)),
-        'kd': DistStrategy(dist.LogNormal(0., .25)),
-        'ud': DistStrategy(dist.LogNormal(0., 1.)),
-        'd1': DistStrategy(dist.Beta(1., 1.)),
-        'ID0': DistStrategy(dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)),
-        'fd0': DistStrategy(dist.Beta(1., 1.)),
-        'gd': DistStrategy(dist.LogNormal(0., 2.)),
-        'ad0': DistStrategy(dist.TruncatedDistribution(
-            dist.Normal(70. * 365., 365.),
-            low=40. * 365.,
-            high=100. * 365.
-        )),
-        'rU': DistStrategy(dist.LogNormal(0., 1.))
-    },
-    #DistStrategy(SiteDistribution({'EIR': est_EIR, 'etas': etas}, noise))
-    DistStrategy(dist.Uniform(0., 500.)), # EIR
-    DistStrategy(dist.Uniform(1/(100 * 365), 1/(40 * 365))) # eta
-]
-
-prior_test_space = [
-        {
-        'kb': DistStrategy(dist.LogNormal(0., .25)),
-        'ub': DistStrategy(dist.LogNormal(0., 1.)),
-        'b0': DistStrategy(dist.Beta(1., 1.)),
-        'IB0': DistStrategy(dist.TruncatedDistribution(dist.Normal(50., 20.), low=25., high=75.)),
-        'kc': DistStrategy(dist.LogNormal(0., .25)),
-        'uc': DistStrategy(dist.LogNormal(0., 1.)),
-        'IC0': DistStrategy(dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)),
-        'phi0': DistStrategy(dist.Beta(2., 1.)),
-        'phi1': DistStrategy(dist.Beta(1., 5.)),
-        'PM': DistStrategy(dist.Beta(1., 1.)),
-        'dm': DistStrategy(dist.TruncatedDistribution(dist.Normal(50., 20.), low=5., high=100.)),
-        'kd': DistStrategy(dist.LogNormal(0., .25)),
-        'ud': DistStrategy(dist.LogNormal(0., 1.)),
-        'd1': DistStrategy(dist.Beta(1., 1.)),
-        'ID0': DistStrategy(dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)),
-        'fd0': DistStrategy(dist.Beta(1., 1.)),
-        'gd': DistStrategy(dist.LogNormal(0., 2.)),
-        'ad0': DistStrategy(dist.TruncatedDistribution(
-            dist.Normal(70. * 365., 365.),
-            low=40. * 365.,
-            high=100. * 365.
-        )),
-        'rU': DistStrategy(dist.LogNormal(0., 1.))
-    },
-    DistStrategy(dist.Uniform(0., 500.)), # EIR
-    DistStrategy(dist.Uniform(1/(100 * 365), 1/(40 * 365))) # eta
-]
-```
-
-```{code-cell} ipython3
-def model(true_EIRs=None, prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
+def model(
+    true_EIRs=None,
+    prev=None,
+    inc=None,
+    impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
     with numpyro.plate('sites', n_sites):
         EIR = numpyro.sample('EIR', dist.Uniform(0., 500.), obs=true_EIRs)
     
@@ -188,22 +125,34 @@ def model(true_EIRs=None, prev=None, inc=None, impl=lambda p, e, a: prev_stats_m
     kb = numpyro.sample('kb', dist.LogNormal(0., .25))
     ub = numpyro.sample('ub', dist.LogNormal(0., 1.))
     b0 = numpyro.sample('b0', dist.Beta(1., 1.))
-    IB0 = numpyro.sample('IB0', dist.TruncatedDistribution(dist.Normal(50., 20.), low=25., high=75.))
+    IB0 = numpyro.sample(
+        'IB0',
+        dist.TruncatedDistribution(dist.Normal(50., 20.), low=25., high=75.)
+    )
     
     # Clinical immunity
     kc = numpyro.sample('kc', dist.LogNormal(0., .25))
     uc = numpyro.sample('uc', dist.LogNormal(0., 1.))
     phi0 = numpyro.sample('phi0', dist.Beta(2., 1.))
     phi1 = numpyro.sample('phi1', dist.Beta(1., 5.))
-    IC0 = numpyro.sample('IC0',dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.))
+    IC0 = numpyro.sample(
+        'IC0',
+        dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)
+    )
     PM = numpyro.sample('PM', dist.Beta(1., 1.))
-    dm = numpyro.sample('dm', dist.TruncatedDistribution(dist.Normal(50., 20.), low=5., high=100.))
+    dm = numpyro.sample(
+        'dm',
+        dist.TruncatedDistribution(dist.Normal(50., 20.), low=5., high=100.)
+    )
     
     # Detection immunity
     kd = numpyro.sample('kd', dist.LogNormal(0., .25))
     ud = numpyro.sample('ud', dist.LogNormal(0., 1.))
     d1 = numpyro.sample('d1', dist.Beta(1., 1.))
-    ID0 = numpyro.sample('ID0', dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.))
+    ID0 = numpyro.sample(
+        'ID0',
+        dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)
+    )
     fd0 = numpyro.sample('fd0', dist.Beta(1., 1.))
     gd = numpyro.sample('gd', dist.LogNormal(0., 2.))
     ad0 = numpyro.sample('ad0', dist.TruncatedDistribution(
@@ -264,17 +213,49 @@ true_values = Predictive(model, num_samples=1)(key_i, true_EIRs=EIRs)
 ```
 
 ```{code-cell} ipython3
+key, key_i = random.split(key)
+prior = Predictive(model, num_samples=600)(key_i)
+```
+
+```{code-cell} ipython3
+prior_space = [
+    {
+        'kb': DistStrategy(dist.LogNormal(0., .25)),
+        'ub': DistStrategy(dist.LogNormal(0., 1.)),
+        'b0': DistStrategy(dist.Beta(1., 1.)),
+        'IB0': DistStrategy(dist.TruncatedDistribution(dist.Normal(50., 20.), low=25., high=75.)),
+        'kc': DistStrategy(dist.LogNormal(0., .25)),
+        'uc': DistStrategy(dist.LogNormal(0., 1.)),
+        'IC0': DistStrategy(dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)),
+        'phi0': DistStrategy(dist.Beta(2., 1.)),
+        'phi1': DistStrategy(dist.Beta(1., 5.)),
+        'PM': DistStrategy(dist.Beta(1., 1.)),
+        'dm': DistStrategy(dist.TruncatedDistribution(dist.Normal(50., 20.), low=5., high=100.)),
+        'kd': DistStrategy(dist.LogNormal(0., .25)),
+        'ud': DistStrategy(dist.LogNormal(0., 1.)),
+        'd1': DistStrategy(dist.Beta(1., 1.)),
+        'ID0': DistStrategy(dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)),
+        'fd0': DistStrategy(dist.Beta(1., 1.)),
+        'gd': DistStrategy(dist.LogNormal(0., 2.)),
+        'ad0': DistStrategy(dist.TruncatedDistribution(
+            dist.Normal(70. * 365., 365.),
+            low=40. * 365.,
+            high=100. * 365.
+        )),
+        'rU': DistStrategy(dist.LogNormal(0., 1.))
+    },
+    DistStrategy(dist.Uniform(0., 500.)), # EIR
+    DistStrategy(dist.Uniform(1/(100 * 365), 1/(40 * 365))) # eta
+]
+```
+
+```{code-cell} ipython3
 obs_inc, obs_prev = (true_values['obs_inc'], true_values['obs_prev'])
 ```
 
 ```{code-cell} ipython3
 def without_obs(params):
     return {k : v for k, v in params.items() if not k in {'obs_inc', 'obs_prev'}}
-```
-
-```{code-cell} ipython3
-key, key_i = random.split(key)
-prior = Predictive(model, num_samples=1000)(key)
 ```
 
 ```{code-cell} ipython3
@@ -439,7 +420,7 @@ def make_net(surrogate, y):
     y0 = tree_map(lambda x: x[0], y)
     y0_vec = surrogate.vectorise_output(y0)
     return MLP(
-        units=265,
+        units=256,
         n_hidden=2,
         n_output=jnp.size(y0_vec),
         dropout_rate=.2,
@@ -853,6 +834,46 @@ def surrogate_posterior_fixed(surrogate, net, params, key):
 ```
 
 ```{code-cell} ipython3
+from numpyro import optim
+from numpyro.infer import SVI, Trace_ELBO
+from numpyro.infer.autoguide import AutoBNAFNormal
+
+def surrogate_posterior_svi(key, impl):
+    n_samples = 500
+    n_train_samples = 50_000
+    
+    guide = AutoBNAFNormal(model, num_flows=5)
+    svi = SVI(
+        model,
+        guide,
+        optim.ClippedAdam(1e-4),
+        loss=Trace_ELBO(num_particles=8),
+        true_EIRs=None,
+        prev=obs_prev,
+        inc=obs_inc,
+        impl=impl
+    )
+
+    # train SVI
+    sample_key, key = random.split(key, 2)
+    svi_result = svi.run(sample_key, n_train_samples, stable_update=True)
+    svi_params = svi_result.params
+
+    # sample posterior
+    post_key, key = random.split(key, 2)
+    posterior_samples = Predictive(
+        guide,
+        params=svi_params,
+        num_samples=n_samples
+    )(post_key)
+
+    return posterior_samples
+
+def surrogate_posterior_full_svi(surrogate, net, params, key):
+    return surrogate_posterior_svi(key, surrogate_impl_full(surrogate, net, params))
+```
+
+```{code-cell} ipython3
 lhs_full_mcmc = surrogate_posterior_full(
     surrogate_lhs_full,
     net_full,
@@ -863,12 +884,46 @@ X_post_lhs_full = lhs_full_mcmc.get_samples()
 ```
 
 ```{code-cell} ipython3
+X_post_lhs_full_svi = surrogate_posterior_full_svi(
+    surrogate_lhs_full,
+    net_full,
+    train_state_lhs_full.params,
+    key
+)
+```
+
+```{code-cell} ipython3
+def wo_latent(X):
+    return {k: v for k, v in X.items() if k != '_auto_latent'}
+
+tree_map(lambda x: x.mean(), wo_latent(X_post_lhs_full_svi))
+```
+
+```{code-cell} ipython3
+true_values
+```
+
+```{code-cell} ipython3
+lhs_full_mcmc.print_summary()
+```
+
+```{code-cell} ipython3
 y_post_lhs_full = prev_stats_posterior(X_post_lhs_full)
 y_post_lhs_full_hat = prev_stats_full_surrogate_posterior(
     surrogate_lhs_full,
     net_full,
     train_state_lhs_full.params,
     X_post_lhs_full
+)
+```
+
+```{code-cell} ipython3
+y_post_lhs_full_svi = prev_stats_posterior(X_post_lhs_full_svi)
+y_post_lhs_full_svi_hat = prev_stats_full_surrogate_posterior(
+    surrogate_lhs_full,
+    net_full,
+    train_state_lhs_full.params,
+    wo_latent(X_post_lhs_full_svi)
 )
 ```
 
@@ -924,7 +979,6 @@ y_post_prior_fixed_hat = prev_stats_fixed_surrogate_posterior(
 ```
 
 ```{code-cell} ipython3
-val_size = int(1e4)
 y_val_prior = prev_stats_posterior(without_obs(prior))
 ```
 
@@ -935,6 +989,9 @@ y_val_lhs_full_hat = prev_stats_full_surrogate_posterior(
     train_state_lhs_full.params,
     without_obs(prior)
 )
+```
+
+```{code-cell} ipython3
 y_val_prior_fixed_hat = prev_stats_fixed_surrogate_posterior(
     surrogate_prior_fixed,
     net_fixed,
@@ -960,6 +1017,131 @@ y_val_prior_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_f
 
 y_val_lhs_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, params_prior_full, X_val_lhs)
 y_val_lhs_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fixed, params_prior_fixed, X_val_lhs)
+```
+
+```{code-cell} ipython3
+from numpyro.infer import log_likelihood
+
+lhs_full_svi_ll = log_likelihood(
+    model,
+    X_post_lhs_full_svi,
+    prev=obs_prev,
+    inc=obs_inc
+)
+
+lhs_full_ll = log_likelihood(
+    model,
+    X_post_lhs_full,
+    prev=obs_prev,
+    inc=obs_inc
+)
+```
+
+```{code-cell} ipython3
+tree_map(jnp.mean, lhs_full_ll)
+```
+
+```{code-cell} ipython3
+tree_map(jnp.mean, lhs_full_svi_ll)
+```
+
+```{code-cell} ipython3
+from numpyro.infer.util import log_density
+from numpyro import handlers
+
+def densities(p, pp):
+    _p = {k: v[0] if k == 'EIR' else v for k, v in without_obs(p).items()}
+    ld = log_density(handlers.seed(model, key), [], {}, _p)
+    return pd.DataFrame(
+        jnp.concatenate(
+            [
+                jnp.mean(ld[1]['obs_prev']['fn'].base_dist.log_prob(pp['obs_prev']), axis=0),
+                jnp.mean(ld[1]['obs_inc']['fn'].base_dist.log_prob(pp['obs_inc']), axis=0)
+            ],
+            axis=1
+        ),
+        columns=['prev_2_10', 'prev_10+', 'inc_0_5', 'inc_5_15', 'inc_15+']
+    ).assign(EIR=EIRs)
+densities(true_values, lhs_full_svi_pp)
+```
+
+```{code-cell} ipython3
+tree_map(lambda x: jnp.mean(x, axis=0), ld)
+```
+
+```{code-cell} ipython3
+import arviz as az
+
+def _to_arviz_dict(samples):
+    return {
+        k: v[None, ...]
+        for k, v in samples.items()
+    }
+
+lhs_full_svi_pp = Predictive(model, X_post_lhs_full_svi)(key_i)
+lhs_full_svi_idata = az.from_dict(
+    posterior=_to_arviz_dict(X_post_lhs_full_svi),
+    posterior_predictive=_to_arviz_dict(lhs_full_svi_pp),
+    observed_data={
+        'obs_prev': obs_prev,
+        'obs_inc': obs_inc
+    }
+)
+
+lhs_full_pp = Predictive(model, X_post_lhs_full)(key_i)
+lhs_full_idata = az.from_dict(
+    posterior=_to_arviz_dict(X_post_lhs_full),
+    posterior_predictive=_to_arviz_dict(lhs_full_pp),
+    observed_data={
+        'obs_prev': obs_prev,
+        'obs_inc': obs_inc
+    }
+)
+```
+
+```{code-cell} ipython3
+az.plot_ppc(
+    lhs_full_idata,
+    flatten=[],
+    kind='scatter'
+)
+```
+
+```{code-cell} ipython3
+az.plot_ppc(
+    lhs_full_svi_idata,
+    flatten=[],
+    kind='scatter'
+)
+```
+
+```{code-cell} ipython3
+az.plot_bpv(
+    lhs_full_idata,
+    kind='t_stat'
+)
+```
+
+```{code-cell} ipython3
+lhs_full_svi_idata.observed_data.obs_prev
+```
+
+```{code-cell} ipython3
+lhs_full_svi_idata.posterior_predictive.obs_prev
+```
+
+```{code-cell} ipython3
+az.plot_bpv(
+    lhs_full_idata,
+    kind='u_value'
+)
+```
+
+```{code-cell} ipython3
+az.plot_bpv(
+    lhs_full_svi_idata,
+    kind='u_value'
+)
 ```
 
 ```{code-cell} ipython3
@@ -1011,10 +1193,11 @@ plot_predictive_error(y_post_lhs_fixed, y_post_lhs_fixed_hat)
 ```
 
 ```{code-cell} ipython3
-def approximation_error(exps, labels, ys, y_hats):
+def approximation_error(exps, labels, ys, y_hats, std_surrogate):
     y_labels = ['prev2-10', 'prev10+', 'inc0-5', 'inc5-15', 'inc15+']
     ys = [jnp.concatenate(y, axis=2) for y in ys]
     y_hats = [jnp.concatenate(y_hat, axis=2) for y_hat in y_hats]
+    
     return pd.DataFrame([
         {
             'mse': jnp.mean(jnp.square(y - y_hat)[:, i, j]),
@@ -1028,14 +1211,43 @@ def approximation_error(exps, labels, ys, y_hats):
         for j in range(len(y_labels))
         for exp, label, y, y_hat in zip(exps, labels, ys, y_hats)
     ])
+
+def stand_approximation_error(exps, labels, ys, y_hats, std_surrogate):
+    ys = [
+        vmap(std_surrogate.vectorise_output, in_axes=[tla(y)])(y)
+        for y in ys
+    ]
+    y_hats = [
+        vmap(std_surrogate.vectorise_output, in_axes=[tla(y_hat)])(y_hat)
+        for y_hat in y_hats
+    ]
+    
+    return pd.DataFrame([
+        {
+            'mse': jnp.mean(jnp.square(y - y_hat)),
+            'test_set': label,
+            'experiment': exp
+        }
+        for exp, label, y, y_hat in zip(exps, labels, ys, y_hats)
+    ])
+```
+
+```{code-cell} ipython3
+stand_approximation_error(
+    ['lhs_full', 'lhs_full'],
+    ['prior', 'posterior'],
+    [y_val_prior, y_post_lhs_full_svi],
+    [y_val_lhs_full_hat, y_post_lhs_full_svi_hat],
+    surrogate_lhs_fixed
+)
 ```
 
 ```{code-cell} ipython3
 approximation_error(
-    ['lhs_full', 'prior_fixed'],
-    ['prior', 'prior'],
-    [y_val_prior, y_val_prior],
-    [y_val_lhs_full_hat, y_val_prior_fixed_hat]
+    ['lhs_full', 'lhs_full'],
+    ['prior', 'posterior'],
+    [y_val_prior, y_post_lhs_full_svi],
+    [y_val_lhs_full_hat, y_post_lhs_full_svi_hat]
 )
 ```
 
@@ -1066,6 +1278,26 @@ pd.concat([
 ```
 
 ```{code-cell} ipython3
+def stand_mspe(key, labels, posteriors, std_surrogate):
+    keys = random.split(key, len(posteriors))
+    y = std_surrogate.vectorise_output((obs_prev, obs_inc))
+    pps = [
+        Predictive(model, p)(key_i)
+        for key_i, p in zip(keys, posteriors)
+    ]
+    std_pps = [
+        vmap(std_surrogate.vectorise_output, in_axes=[(0, 0)])((pp['obs_prev'], pp['obs_inc']))
+        for pp in pps
+    ]
+    return pd.DataFrame([
+        {'mspe': jnp.mean(jnp.square(y - pp)), 'experiment': label}
+        for label, pp in zip(labels, std_pps)
+    ])
+
+stand_mspe(key, ['lhs_full_svi'], [X_post_lhs_full_svi], surrogate_lhs_fixed)
+```
+
+```{code-cell} ipython3
 def mspe(key, labels, posteriors):
     prev_columns = ['prev_2_10', 'prev_10+']
     inc_columns = ['inc_0_5', 'inc_5_15', 'inc_15+']
@@ -1088,7 +1320,7 @@ def mspe(key, labels, posteriors):
         for label, pp in zip(labels, posterior_predictives)
     ])
 
-mspe(key, ['lhs_full'], [X_post_lhs_full])
+mspe(key, ['lhs_full', 'lhs_full_svi'], [X_post_lhs_full, X_post_lhs_full_svi])
 ```
 
 ```{code-cell} ipython3
@@ -1411,7 +1643,7 @@ def get_batch_imm_curves(params):
 ```
 
 ```{code-cell} ipython3
-posterior_imm_curves = get_batch_imm_curves(prior_full_samples)
+posterior_imm_curves = get_batch_imm_curves(X_post_lhs_full_svi)
 true_imm_curves = get_batch_imm_curves(without_obs(true_values))
 ```
 
@@ -1440,7 +1672,7 @@ import seaborn as sns
 ```{code-cell} ipython3
 samples = sorted(
     list(
-        {int(path.split('_')[0]) for path in glob('*_round_*_approx_error.csv')}
+        {int(path.split('_')[0]) for path in glob('*_round_*_ll.csv')}
     )
 )
 rounds = list(range(5))
@@ -1448,7 +1680,11 @@ rounds = list(range(5))
 
 ```{code-cell} ipython3
 ks_error = pd.concat([
-    pd.read_csv(f'{s}_round_{r}_ks_error.csv').assign(samples=s, round=r)
+    pd.read_csv(f'{s}_round_{r}_svi_ks_error.csv').assign(samples=s, round=r, sampler='svi')
+    for s in samples
+    for r in rounds
+] + [
+    pd.read_csv(f'{s}_round_{r}_ks_error.csv').assign(samples=s, round=r, sampler='mcmc')
     for s in samples
     for r in rounds
 ])
@@ -1458,6 +1694,7 @@ ks_error = pd.concat([
 g = sns.FacetGrid(
     ks_error,
     col="samples",
+    row='sampler',
     hue='experiment',
     margin_titles=True
 )
@@ -1470,7 +1707,8 @@ fig, ax = plt.subplots(figsize=(19.7, 8.27))
 sns.barplot(
     ks_error[
         (ks_error.samples == 500000) &
-        (ks_error['round'] == max(ks_error['round']))
+        (ks_error['round'] == max(ks_error['round'])) &
+        (ks_error['sampler'] == 'mcmc')
         #ks_error.variable.isin(['b0', 'phi0', 'phi1'])
     ],
     x='variable',
@@ -1487,10 +1725,39 @@ ax.set_title('Posterior agreement of surrogates with original model')
 
 ```{code-cell} ipython3
 approx_error = pd.concat([
-    pd.read_csv(f'{s}_round_{r}_approx_error.csv').assign(samples=s, round=r)
+    pd.read_csv(f'{s}_round_{r}_svi_approx_error.csv').assign(samples=s, round=r, sampler='svi')
+    for s in samples
+    for r in rounds
+] + [
+    pd.read_csv(f'{s}_round_{r}_approx_error.csv').assign(samples=s, round=r, sampler='mcmc')
     for s in samples
     for r in rounds
 ])
+
+stand_approx_error = pd.concat([
+    pd.read_csv(f'{s}_round_{r}_svi_stand_approx_error.csv').assign(samples=s, round=r, sampler='svi')
+    for s in samples
+    for r in rounds
+] + [
+    pd.read_csv(f'{s}_round_{r}_stand_approx_error.csv').assign(samples=s, round=r, sampler='mcmc')
+    for s in samples
+    for r in rounds
+])
+```
+
+```{code-cell} ipython3
+g = sns.FacetGrid(
+    stand_approx_error,
+    row="test_set",
+    col="samples",
+    hue="experiment",
+    margin_titles=True,
+    sharey=False
+)
+g.map(sns.lineplot, "round", "mse")
+for ax in g.axes_dict.values():
+    ax.set_yscale('log')
+g.add_legend()
 ```
 
 ```{code-cell} ipython3
@@ -1510,22 +1777,6 @@ g.add_legend()
 ```
 
 ```{code-cell} ipython3
-g = sns.FacetGrid(
-    approx_error,
-    row="test_set",
-    col="samples",
-    hue="experiment",
-    margin_titles=True,
-    sharey=False
-)
-g.map(sns.lineplot, "round", "mse")
-for ax in g.axes_dict.values():
-    ax.tick_params(axis='x', labelrotation=45)
-    ax.set_yscale('log')
-g.add_legend()
-```
-
-```{code-cell} ipython3
 timings = pd.concat([
     pd.read_csv(f'{s}_round_{r}_timings.csv').assign(samples=s, round=r)
     for s in samples
@@ -1537,10 +1788,14 @@ timings = pd.concat([
 timings = pd.melt(
     timings,
     id_vars=['experiment', 'samples', 'round'],
-    value_vars=['sampling', 'training', 'mcmc'],
+    value_vars=['sampling', 'training', 'mcmc', 'svi'],
     var_name='task',
     value_name='time'
 )
+```
+
+```{code-cell} ipython3
+timings
 ```
 
 ```{code-cell} ipython3
@@ -1552,52 +1807,124 @@ sns.lineplot(
 ```
 
 ```{code-cell} ipython3
-sns.boxplot(timings[(timings.task == 'mcmc')][['time']])
+sns.violinplot(timings[timings.task.isin(['svi', 'mcmc'])], x='task', y='time')
 ```
 
 ```{code-cell} ipython3
-sns.boxplot(timings[(timings.task == 'training')][['time']])
-```
-
-```{code-cell} ipython3
-mspe = pd.concat([
-    pd.read_csv(f'{s}_round_{r}_mspe.csv').assign(samples=s, round=r)
+ll = pd.concat([
+    pd.read_csv(
+        f'{s}_round_{r}_ll.csv'
+    ).assign(samples=s, round=r, sampler='mcmc')
+    for s in samples
+    for r in rounds
+] + [
+    pd.read_csv(
+        f'{s}_round_{r}_svi_ll.csv'
+    ).assign(samples=s, round=r, sampler='svi')
     for s in samples
     for r in rounds
 ])
-u_mspe = pd.read_csv('underlying_mspe.csv')
 ```
 
 ```{code-cell} ipython3
-mspe = pd.melt(
-    mspe,
-    id_vars=['experiment', 'samples', 'EIR', 'round'],
-    value_vars=['inc_0_5', 'inc_5_15', 'inc_15+', 'prev_2_10', 'prev_10+'],
-    var_name='output',
-    value_name='mspe'
+u_ll = pd.read_csv('underlying_ll.csv')
+```
+
+```{code-cell} ipython3
+u_ll = pd.melt(
+    u_ll,
+    id_vars=['experiments'],
+    value_vars=['obs_inc', 'obs_prev'],
+    var_name='obs',
+    value_name='log_likelihood'
 )
-u_mspe = pd.melt(
-    u_mspe,
-    id_vars=['experiment', 'EIR'],
-    value_vars=['inc_0_5', 'inc_5_15', 'inc_15+', 'prev_2_10', 'prev_10+'],
+```
+
+```{code-cell} ipython3
+ll = pd.melt(
+    ll,
+    id_vars=['experiments', 'samples', 'round', 'sampler'],
+    value_vars=['obs_inc', 'obs_prev'],
+    var_name='obs',
+    value_name='log_likelihood'
+)
+```
+
+```{code-cell} ipython3
+u_ll.log_likelihood
+```
+
+```{code-cell} ipython3
+g = sns.FacetGrid(
+    ll[ll.obs == 'obs_inc'],
+    col='samples',
+    row="sampler",
+    hue="experiments",
+    margin_titles=True
+)
+g.map(sns.scatterplot, "round", "log_likelihood")
+for (e, s), ax in g.axes_dict.items():
+    #ax.set_yscale('log')
+    y = u_ll[u_ll.obs == 'obs_inc'].log_likelihood.iloc[0]
+    ax.axhline(y, 0, 4, ls='--')
+    #ax.fill_between(list(range(5)), y.min(), y.max(), color='black', alpha=.1)
+g.add_legend()
+```
+
+```{code-cell} ipython3
+pp_ll = pd.concat([
+    pd.read_csv(
+        f'{s}_round_{r}_pp_ll.csv'
+    ).assign(samples=s, round=r, sampler='mcmc')
+    for s in samples
+    for r in rounds
+] + [
+    pd.read_csv(
+        f'{s}_round_{r}_svi_pp_ll.csv'
+    ).assign(samples=s, round=r, sampler='svi')
+    for s in samples
+    for r in rounds
+])
+```
+
+```{code-cell} ipython3
+pp_ll = pd.melt(
+    pp_ll,
+    id_vars=['experiment', 'samples', 'round', 'sampler', 'EIR'],
+    value_vars=['prev_2_10', 'prev_10+', 'inc_0_5', 'inc_5_15', 'inc_15+'],
     var_name='output',
-    value_name='mspe'
+    value_name='log_likelihood'
+)
+```
+
+```{code-cell} ipython3
+u_pp_ll = pd.read_csv('underlying_pp_ll.csv')
+```
+
+```{code-cell} ipython3
+u_pp_ll = pd.melt(
+    u_pp_ll,
+    id_vars=['experiment', 'EIR'],
+    value_vars=['prev_2_10', 'prev_10+', 'inc_0_5', 'inc_5_15', 'inc_15+'],
+    var_name='output',
+    value_name='log_likelihood'
 )
 ```
 
 ```{code-cell} ipython3
 g = sns.FacetGrid(
-    mspe,
+    pp_ll,
     col='samples',
-    row="EIR",
+    row="sampler",
     hue="experiment",
     margin_titles=True
 )
-g.map(sns.lineplot, "round", "mspe")
+g.map(sns.lineplot, "round", "log_likelihood")
 for (e, s), ax in g.axes_dict.items():
-    ax.set_yscale('log')
-    y = u_mspe[u_mspe.EIR == e].mspe.mean()
-    ax.axhline(y, 0, 4, ls='--')
+    #ax.set_yscale('log')
+    y = u_pp_ll.log_likelihood
+    ax.axhline(y.mean(), 0, 4, ls='--')
+    ax.fill_between(list(range(5)), y.min(), y.max(), color='black', alpha=.1)
 g.add_legend()
 ```
 
@@ -1613,22 +1940,14 @@ summaries.r_hat = pd.to_numeric(summaries.r_hat)
 
 ```{code-cell} ipython3
 g = sns.FacetGrid(
-    summaries[summaries['index'] != 'EIR'],
+    summaries,
     col='samples',
     hue="experiment",
-    margin_titles=True
+    margin_titles=True,
+    sharey=False
 )
 g.map(sns.lineplot, "round", "r_hat")
 g.add_legend()
-```
-
-```{code-cell} ipython3
-summaries[
-    (summaries['index'] != 'EIR') &
-    (summaries.samples == 500000) &
-    (summaries['round'] == 0) &
-    (summaries['experiment'] == 'lhs_fixed')
-][['index', 'samples', 'round', 'r_hat', 'experiment']]
 ```
 
 ```{code-cell} ipython3
