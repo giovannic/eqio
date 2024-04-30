@@ -200,7 +200,7 @@ def model(
     # Detection immunity
     kd = numpyro.sample('kd', dist.LogNormal(0., .25))
     ud = numpyro.sample('ud', dist.LogNormal(0., 1.))
-    d1 = numpyro.sample('d1', dist.Beta(1., 1.))
+    d1 = numpyro.sample('d1', dist.Beta(1., 5.))
     ID0 = numpyro.sample('ID0', dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.))
     fd0 = numpyro.sample('fd0', dist.Beta(1., 1.))
     gd = numpyro.sample('gd', dist.LogNormal(0., 2.))
@@ -456,12 +456,21 @@ def get_immunity_curve(params):
     (d1, ID0, fd0, gd, ad0, kd) = params['d1'], params['ID0'], params['fd0'], params['gd'], params['ad0'], params['kd']
     b1 = dmeq.default_parameters()['b1']
     a = 5 * 365
+    #fd0 = .8
+    #gd = 7.
+    #ID0 = 1.5
+    #kd = 5.
+    d1 = .1
     fd = 1-(1-fd0)/(1+(a/ad0)**gd)
     return {
         'prob_b': b0 * ((1 - b1)/(1 + (exposures/IB0)**kb) + b1),
         'prob_c': phi0 * ((1 - phi1)/(1 + (exposures/IC0)**kc) + phi1),
         'prob_d': d1 + (1 - d1)/(1 + fd * (exposures/ID0)**kd)
     }
+```
+
+```{code-cell} ipython3
+dmeq.default_parameters()['d1']
 ```
 
 ```{code-cell} ipython3

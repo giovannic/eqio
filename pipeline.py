@@ -22,12 +22,16 @@ import pandas as pd
 import pickle
 from time import time
 import logging
+import os
+
 logging.basicConfig(
     format='%(asctime)s.%(msecs)03d %(levelname)s %(module)s - %(funcName)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+out_dir = 'outputs/v1'
 
 def timing(f):
     def wrap(*args, **kw):
@@ -39,7 +43,7 @@ def timing(f):
 
 key = random.PRNGKey(42)
 cpu_device = jax.devices('cpu')[0]
-n_chains = 4
+n_chains = 10
 epochs = 1000
 n_rounds = 5
 
@@ -119,7 +123,7 @@ prior_parameter_space = [
         'dm': DistStrategy(dist.TruncatedDistribution(dist.Normal(50., 20.), low=5., high=100.)),
         'kd': DistStrategy(dist.LogNormal(0., .25)),
         'ud': DistStrategy(dist.LogNormal(0., 1.)),
-        'd1': DistStrategy(dist.Beta(1., 1.)),
+        'd1': DistStrategy(dist.Beta(1., 5.)),
         'ID0': DistStrategy(dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)),
         'fd0': DistStrategy(dist.Beta(1., 1.)),
         'gd': DistStrategy(dist.LogNormal(0., 2.)),
@@ -161,7 +165,7 @@ def model(true_EIRs=None, prev=None, inc=None, impl=lambda p, e, a: prev_stats_m
     # Detection immunity
     kd = numpyro.sample('kd', dist.LogNormal(0., .25))
     ud = numpyro.sample('ud', dist.LogNormal(0., 1.))
-    d1 = numpyro.sample('d1', dist.Beta(1., 1.))
+    d1 = numpyro.sample('d1', dist.Beta(1., 5.))
     ID0 = numpyro.sample('ID0', dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.))
     fd0 = numpyro.sample('fd0', dist.Beta(1., 1.))
     gd = numpyro.sample('gd', dist.LogNormal(0., 2.))
@@ -242,7 +246,8 @@ with jax.default_device(cpu_device):
 logger.info('done')
 
 
-from jax import pmap, tree_map
+from jax import pmap
+from jax.tree_util import tree_map, tree_leaves
 import pandas as pd
 
 device_count = len(jax.devices())
@@ -293,17 +298,8 @@ x_max = [{
 }]
 
 
-# In[20]:
-
-
 print(pd.concat([intrinsic_bounds]).to_latex(index=False, float_format="{:0.0f}".format))
 
-
-# In[21]:
-
-
-
-# In[22]:
 
 from mox.sampling import sample
 from mox.surrogates import (
@@ -497,29 +493,27 @@ def surrogate_impl_fixed(surrogate, net, net_params):
         a
     )
 
-import numpyro
-
-def surrogate_posterior(key, impl):
-    n_samples = 500
-    n_warmup = 500
-
+def surrogate_posterior(key, impl, init_params, n_samples):
+    # Initialise MCMC
     kernel = NUTS(model, forward_mode_differentiation=True) # Reverse mode has lead to initialisation errors
-
+    n_warmup = 500
     mcmc = MCMC(
         kernel,
-        num_samples=n_samples,
+        num_samples=n_samples // n_chains,
         num_warmup=n_warmup,
         num_chains=n_chains,
         chain_method='vectorized' #pmap leads to segfault for some reason (https://github.com/google/jax/issues/13858)
     )
-    mcmc.run(key, None, obs_prev, obs_inc, impl)
+
+    mcmc.run(
+        key,
+        None,
+        obs_prev,
+        obs_inc,
+        impl,
+        #init_params=init_params
+    )
     return mcmc
-
-def surrogate_posterior_full(surrogate, net, params, key):
-    return surrogate_posterior(key, surrogate_impl_full(surrogate, net, params))
-
-def surrogate_posterior_fixed(surrogate, net, params, key):
-    return surrogate_posterior(key, surrogate_impl_fixed(surrogate, net, params))
 
 from numpyro import optim
 from numpyro.infer import SVI, Trace_ELBO
@@ -532,25 +526,21 @@ def wo_latent(X):
         if k != '_auto_latent'
     }
 
-def surrogate_posterior_svi(key, impl):
-    n_samples = 500 * n_chains
+def surrogate_posterior_svi(key, svi, guide, svi_state, impl, n_samples):
     n_train_samples = 50_000
-    
-    guide = AutoBNAFNormal(model, num_flows=5)
-    svi = SVI(
-        model,
-        guide,
-        optim.ClippedAdam(1e-4),
-        loss=Trace_ELBO(num_particles=8),
+
+    # train SVI
+    sample_key, key = random.split(key, 2)
+    svi_result = svi.run(
+        sample_key,
+        n_train_samples,
+        init_state=svi_state,
+        stable_update=True,
         true_EIRs=None,
         prev=obs_prev,
         inc=obs_inc,
         impl=impl
     )
-
-    # train SVI
-    sample_key, key = random.split(key, 2)
-    svi_result = svi.run(sample_key, n_train_samples, stable_update=True)
     svi_params = svi_result.params
 
     # sample posterior
@@ -563,13 +553,7 @@ def surrogate_posterior_svi(key, impl):
 
     posterior_samples = wo_latent(posterior_samples) 
 
-    return posterior_samples
-
-def surrogate_posterior_full_svi(surrogate, net, params, key):
-    return surrogate_posterior_svi(key, surrogate_impl_full(surrogate, net, params))
-
-def surrogate_posterior_fixed_svi(surrogate, net, params, key):
-    return surrogate_posterior_svi(key, surrogate_impl_fixed(surrogate, net, params))
+    return posterior_samples, svi_result.state, svi_result.losses
 
 logger.info('Making validation set')
 y_val_prior = prev_stats_posterior(without_obs(prior))
@@ -614,7 +598,7 @@ def stand_approximation_error(exps, labels, ys, y_hats, std_surrogate):
     ])
 
 def save_mcmc(name, mcmc):
-    with open(f'chapter_2_mcmc_{name}.pkl', 'wb') as f:
+    with open(os.path.join(out_dir, f'chapter_2_mcmc_{name}.pkl'), 'wb') as f:
         pickle.dump(mcmc, f)
 
 def pp_ll(key, p):
@@ -650,9 +634,9 @@ def ll_df(X_post, labels):
 n_samples = 100
 n_warmup = 100
 
-if os.path.exists('chapter_2_mcmc_underlying.pkl'):
+if os.path.exists(os.path.join(out_dir, 'chapter_2_mcmc_underlying.pkl')):
     logger.info('Loading posterior')
-    with open('chapter_2_mcmc_underlying.pkl', 'rb') as f:
+    with open(os.path.join(out_dir, 'chapter_2_mcmc_underlying.pkl'), 'rb') as f:
         mcmc = pickle.load(f)
     logger.info('done')
 else:
@@ -676,12 +660,12 @@ pp_ll_df(
     key_i,
     [posterior_samples],
     ['underlying']
-).to_csv(f'underlying_pp_ll.csv', index=False)
+).to_csv(os.path.join(out_dir, f'underlying_pp_ll.csv'), index=False)
 
 ll_df(
     [posterior_samples],
     ['underlying']
-).to_csv(f'underlying_ll.csv', index=False)
+).to_csv(os.path.join(out_dir, f'underlying_ll.csv'), index=False)
 logger.info('done')
 
 def make_surrogate_objects(samples, y_min, y_max):
@@ -710,13 +694,25 @@ def train_surrogate_objects(key, surrogate_obj, samples):
         epochs=epochs
     )
 
-def perform_mcmc(key, mcmc_helper, val_helper, obj, train_state):
+def perform_mcmc(
+    key,
+    impl,
+    val_helper,
+    obj,
+    train_state,
+    init_params,
+    n_samples
+    ):
     surrogate, net = obj
-    t, mcmc = timing(mcmc_helper)(
-        surrogate,
-        net,
-        train_state.params,
-        key
+    t, mcmc = timing(surrogate_posterior)(
+        key,
+        impl(
+            surrogate,
+            net,
+            train_state.params
+        ),
+        init_params,
+        n_samples
     )
     X_post = mcmc.get_samples()
     y_post = prev_stats_posterior(X_post)
@@ -730,21 +726,42 @@ def perform_mcmc(key, mcmc_helper, val_helper, obj, train_state):
         summary(mcmc.get_samples(group_by_chain=True)),
         orient='index'
     ).reset_index()
+    init_sample = tree_map(
+        lambda leaf: leaf[:,-1],
+        mcmc.get_samples(True)
+    )
     return (
         t,
         summary_df,
         X_post,
         y_post,
-        y_post_hat
+        y_post_hat,
+        init_sample
     )
 
-def perform_svi(key, svi_helper, val_helper, obj, train_state):
+def perform_svi(
+    key,
+    impl,
+    val_helper,
+    obj,
+    train_state,
+    svi,
+    guide,
+    svi_state,
+    n_samples
+    ):
     surrogate, net = obj
-    t, X_post = timing(svi_helper)(
-        surrogate,
-        net,
-        train_state.params,
-        key
+    t, (X_post, svi_state, losses) = timing(surrogate_posterior_svi)(
+        key,
+        svi,
+        guide,
+        svi_state,
+        impl(
+            surrogate,
+            net,
+            train_state.params
+        ),
+        n_samples
     )
     y_post = prev_stats_posterior(X_post)
     y_post_hat = val_helper(
@@ -757,8 +774,72 @@ def perform_svi(key, svi_helper, val_helper, obj, train_state):
         t,
         X_post,
         y_post,
-        y_post_hat
+        y_post_hat,
+        svi_state,
+        losses
     )
+
+def vectorise_posterior(X):
+    return jnp.concatenate(
+        [
+            l if l.ndim == 2 else l[...,None]
+            for l in tree_leaves(X)
+        ],
+        axis=1
+    )
+
+def sq_euclidean_dist(x, y):
+    if len(x.shape) == 1:
+        x = x.reshape(x.shape[0], 1)
+    if len(y.shape) == 1:
+        y = y.reshape(y.shape[0], 1)
+
+    assert x.shape[-1] == y.shape[-1]
+
+    dist = jnp.sum(
+            jnp.square(x), axis=-1
+            )[..., None] + jnp.sum(
+                    jnp.square(y), axis=-1
+                    )[..., None].T - 2 * jnp.dot(x, y.T)
+    return dist
+
+class SquaredExponential:
+    """
+    Squared exponential kernel.
+    K(x1, x2) = var * exp(-0.5 * ||x1 - x2||^2/l**2)
+    """
+
+    def __init__(self, lengthscale=1., variance=1.):
+        self.lengthscale = lengthscale
+        self.variance = variance
+
+    def __call__(self, x1, x2):
+        assert x1.shape[-1] == x2.shape[-1]
+        dist = sq_euclidean_dist(x1/self.lengthscale, x2/self.lengthscale)
+        k = self.variance * jnp.exp(-0.5 * dist)
+        assert k.shape == (x1.shape[0], x2.shape[0])
+        return k
+
+
+def squared_mmd(X, Y, kernel=SquaredExponential(10., 1.)): 
+    X = jnp.array(X)
+    Y = jnp.array(Y)
+    K_XX = kernel(X, X)
+    K_YY = kernel(Y, Y)
+    K_XY = kernel(X, Y)
+
+    n = K_XX.shape[0]
+    m = K_YY.shape[0]
+
+    mmd_squared = (
+            jnp.sum(K_XX) - jnp.trace(K_XX)
+            ) / (
+                    (n * (n - 1)) +
+                    (jnp.sum(K_YY) - jnp.trace(K_YY)) / (m * (m - 1)) -
+                    2 * jnp.sum(K_XY) / (m * n)
+                    )
+
+    return mmd_squared
 
 def run_pipeline(train_samples, key):
     experiments = [
@@ -767,6 +848,8 @@ def run_pipeline(train_samples, key):
         'lhs_fixed',
         'prior_fixed'
     ]
+
+    methods = ['nuts', 'svi']
 
     logger.info('Sampling LHS')
     key_i, key = random.split(key)
@@ -805,11 +888,24 @@ def run_pipeline(train_samples, key):
         for s in samples[2:]
     ]
 
+
+    # Initialise SVI
+    guide = AutoBNAFNormal(model, num_flows=5)
+    svi = SVI(
+        model,
+        guide,
+        optim.ClippedAdam(1e-4),
+        loss=Trace_ELBO(num_particles=8),
+    )
+
+    init_mcmc = [None] * len(experiments)
+    svi_states = [None] * len(experiments)
+
     for r in range(n_rounds):
-        if os.path.exists(f'{train_samples}_round_{r}_ll.csv'):
+        logger.info(f'Training surrogates: round {r}')
+        if train_samples > 5_000 and r > 0:
             continue
 
-        logger.info(f'Training surrogates: round {r}')
         key, *keys = random.split(key, len(experiments) + 1)
 
         train_times, train_states_mcmc = zip(
@@ -847,23 +943,27 @@ def run_pipeline(train_samples, key):
             summaries,
             X_post,
             y_post,
-            y_post_hat
+            y_post_hat,
+            init_mcmc
         ) = zip(
             *[
                 perform_mcmc(
                     key,
-                    mcmc_helper,
+                    impl,
                     val_helper,
                     obj,
-                    state
+                    state,
+                    init_sample,
+                    train_samples
                 )
-                for key, mcmc_helper, val_helper, obj, state
+                for key, impl, val_helper, obj, state, init_sample
                 in zip(
                     keys,
-                    [surrogate_posterior_full] * 2 + [surrogate_posterior_fixed] * 2,
+                    [surrogate_impl_full] * 2 + [surrogate_impl_fixed] * 2,
                     val_helpers,
                     surrogates,
-                    train_states_mcmc
+                    train_states_mcmc,
+                    init_mcmc
                 )
             ]
         )
@@ -874,23 +974,30 @@ def run_pipeline(train_samples, key):
             svi_times,
             X_post_svi,
             y_post_svi,
-            y_post_svi_hat
+            y_post_svi_hat,
+            svi_states,
+            svi_losses
         ) = zip(
             *[
                 perform_svi(
                     key,
-                    svi_helper,
+                    impl,
                     val_helper,
                     obj,
-                    state
+                    state,
+                    svi,
+                    guide,
+                    svi_state,
+                    train_samples
                 )
-                for key, svi_helper, val_helper, obj, state
+                for key, impl, val_helper, obj, state, svi_state
                 in zip(
                     keys,
-                    [surrogate_posterior_full_svi] * 2 + [surrogate_posterior_fixed_svi] * 2,
+                    [surrogate_impl_full] * 2 + [surrogate_impl_fixed] * 2,
                     val_helpers,
                     surrogates,
-                    train_states_svi
+                    train_states_svi,
+                    svi_states
                 )
             ]
         )
@@ -919,35 +1026,36 @@ def run_pipeline(train_samples, key):
         ]
 
         logger.info('Writing results')
-        approximation_error(
-            [exp for exp in experiments for _ in range(2)],
-            ['prior', 'posterior'] * len(experiments),
-            [truth for pair in zip([y_val_prior] * len(experiments), y_post) for truth in pair],
-            [hat for pair in zip(y_val_mcmc, y_post_hat) for hat in pair]
-        ).to_csv(f'{train_samples}_round_{r}_approx_error.csv', index=False)
+        posts = [
+            (X_post, y_post, y_post_hat),
+            (X_post_svi, y_post_svi, y_post_svi_hat)
+        ]
 
-        approximation_error(
-            [exp for exp in experiments for _ in range(2)],
-            ['prior', 'posterior'] * len(experiments),
-            [truth for pair in zip([y_val_prior] * len(experiments), y_post_svi) for truth in pair],
-            [hat for pair in zip(y_val_svi, y_post_svi_hat) for hat in pair]
-        ).to_csv(f'{train_samples}_round_{r}_svi_approx_error.csv', index=False)
+        vals = [
+            y_val_mcmc,
+            y_val_svi
+        ]
 
-        stand_approximation_error(
-            [exp for exp in experiments for _ in range(2)],
-            ['prior', 'posterior'] * len(experiments),
-            [truth for pair in zip([y_val_prior] * len(experiments), y_post) for truth in pair],
-            [hat for pair in zip(y_val_mcmc, y_post_hat) for hat in pair],
-            surrogates[2][0] # lhs_fixed surrogate for standardising
-        ).to_csv(f'{train_samples}_round_{r}_stand_approx_error.csv', index=False)
+        pd.concat([
+            approximation_error(
+                [exp for exp in experiments for _ in range(2)],
+                ['prior', 'posterior'] * len(experiments),
+                [truth for pair in zip([y_val_prior] * len(experiments), y_post_out) for truth in pair],
+                [hat for pair in zip(y_val_out, y_post_hat_out) for hat in pair]
+            ).assign(method=method)
+            for method, y_val_out, (_, y_post_out, y_post_hat_out) in zip(methods, vals, posts)
+        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_approx_error.csv'), index=False)
 
-        stand_approximation_error(
-            [exp for exp in experiments for _ in range(2)],
-            ['prior', 'posterior'] * len(experiments),
-            [truth for pair in zip([y_val_prior] * len(experiments), y_post_svi) for truth in pair],
-            [hat for pair in zip(y_val_svi, y_post_svi_hat) for hat in pair],
-            surrogates[2][0] # lhs_fixed surrogate for standardising
-        ).to_csv(f'{train_samples}_round_{r}_svi_stand_approx_error.csv', index=False)
+        pd.concat([
+            stand_approximation_error(
+                [exp for exp in experiments for _ in range(2)],
+                ['prior', 'posterior'] * len(experiments),
+                [truth for pair in zip([y_val_prior] * len(experiments), y_post_out) for truth in pair],
+                [hat for pair in zip(y_val_out, y_post_hat_out) for hat in pair],
+                surrogates[2][0] # lhs_fixed surrogate for standardising
+            ).assign(method=method)
+            for method, y_val_out, (_, y_post_out, y_post_hat_out) in zip(methods, vals, posts)
+        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_stand_approx_error.csv'), index=False)
 
         pd.DataFrame({
             'experiment': experiments,
@@ -955,59 +1063,72 @@ def run_pipeline(train_samples, key):
             'training': train_times,
             'mcmc': mcmc_times,
             'svi': svi_times 
-        }).to_csv(f'{train_samples}_round_{r}_timings.csv', index=False)
+        }).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_timings.csv'), index=False)
 
         logger.info('Writing likelihoods')
-        pp_ll_df(
-            key_i,
-            X_post,
-            experiments
-        ).to_csv(f'{train_samples}_round_{r}_pp_ll.csv', index=False)
+        pd.concat([
+            pp_ll_df(
+                key_i,
+                X,
+                experiments
+            ).assign(method=method)
+            for method, (X, _, _) in zip(methods, posts)
+        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_pp_ll.csv'), index=False)
 
-        pp_ll_df(
-            key_i,
-            X_post_svi,
-            experiments
-        ).to_csv(f'{train_samples}_round_{r}_svi_pp_ll.csv', index=False)
+        pd.concat([
+            ll_df(
+                X,
+                experiments
+            ).assign(method=method)
+            for method, (X, _, _) in zip(methods, posts)
+        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_ll.csv'), index=False)
 
-        ll_df(
-            X_post,
-            experiments
-        ).to_csv(f'{train_samples}_round_{r}_ll.csv', index=False)
-
-        ll_df(
-            X_post_svi,
-            experiments
-        ).to_csv(f'{train_samples}_round_{r}_svi_ll.csv', index=False)
-
+        logger.info('Writing KS Error')
         sample_keys = list(posterior_samples.keys())
 
-        pd.DataFrame([
-            {
-                'experiment': name,
-                'variable': k,
-                'statistic': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(posterior[k], -1)).statistic,
-                'p-value': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(posterior[k], -1)).pvalue
-            }
-            for k in sample_keys
-            for name, posterior in zip(experiments, X_post)
-        ]).to_csv(f'{train_samples}_round_{r}_ks_error.csv', index=False)
+        pd.concat([
+            pd.DataFrame([
+                {
+                    'experiment': name,
+                    'variable': k,
+                    'statistic': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(posterior[k], -1)).statistic,
+                    'p-value': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(posterior[k], -1)).pvalue
+                }
+                for k in sample_keys
+                for name, posterior in zip(experiments, X)
+            ]).assign(method=method)
+            for method, (X, _, _) in zip(methods, posts)
+        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_ks_error.csv'), index=False)
 
-        pd.DataFrame([
-            {
-                'experiment': name,
-                'variable': k,
-                'statistic': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(posterior[k], -1)).statistic,
-                'p-value': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(posterior[k], -1)).pvalue
-            }
-            for k in sample_keys
-            for name, posterior in zip(experiments, X_post_svi)
-        ]).to_csv(f'{train_samples}_round_{r}_svi_ks_error.csv', index=False)
+        logger.info('Writing MMD')
+        pd.concat([
+            pd.DataFrame([
+                {
+                    'experiment': name,
+                    'MMD': squared_mmd(
+                        vectorise_posterior(posterior_samples),
+                        vectorise_posterior(posterior)
+                    )
+                }
+                for name, posterior in zip(experiments, X)
+            ]).assign(method=method)
+            for method, (X, _, _) in zip(methods, posts)
+        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_mmd.csv'), index=False)
 
+        logger.info('Writing SVI losses')
+        pd.concat([
+            pd.DataFrame({
+                'loss': losses[::1000],
+                'step': jnp.arange(0, len(losses), 1000)
+            }).assign(experiment=name)
+            for name, losses in zip(experiments, svi_losses)
+        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_svi_losses.csv'), index=False)
+
+        logger.info('MCMC stats')
         pd.concat([
             s.assign(experiment=name)
             for name, s in zip(experiments, summaries)
-        ]).to_csv(f'{train_samples}_round_{r}_mcmc_summary.csv', index=False)
+        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_mcmc_summary.csv'), index=False)
 
         if r != n_rounds - 1:
             logger.info('Concatting samples')
@@ -1042,8 +1163,13 @@ def run_pipeline(train_samples, key):
                 for ((X, y), (X_new, y_new))
                 in zip(samples_svi, new_samples_svi)
             ]
-    
-for n_batches in jnp.linspace(int(10), int(1e3), num=5, dtype=jnp.int64):
+
+runs = jnp.concatenate([
+    jnp.linspace(int(10), int(50), num=5, dtype=jnp.int64),
+    jnp.linspace(int(100), int(5e3), num=5, dtype=jnp.int64)
+])
+
+for n_batches in runs:
     train_samples = n_batches * 100
     logger.info(f'{train_samples} samples')
     run_pipeline(train_samples, key)

@@ -14,16 +14,9 @@ kernelspec:
 
 # TODO
 
- * Standardised mse
- * Likelihood of pp given true theta
- * Likelihood of true theta
- * Bayesian P-value
  * MMD
- * History matching
-
-# Insights
-
- * longer chain convergence for surrogate
+ * Change pipeline to sample train size for rounds
+ * Add annealing
 
 ```{code-cell} ipython3
 cpu_count = 100
@@ -46,7 +39,7 @@ from mox.sampling import LHSStrategy, DistStrategy
 ```
 
 ```{code-cell} ipython3
-n_chains = 4
+n_chains = 10
 ```
 
 ```{code-cell} ipython3
@@ -117,7 +110,9 @@ def model(
     true_EIRs=None,
     prev=None,
     inc=None,
-    impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
+    impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution),
+    alpha=1.
+    ):
     with numpyro.plate('sites', n_sites):
         EIR = numpyro.sample('EIR', dist.Uniform(0., 500.), obs=true_EIRs)
     
@@ -148,7 +143,7 @@ def model(
     # Detection immunity
     kd = numpyro.sample('kd', dist.LogNormal(0., .25))
     ud = numpyro.sample('ud', dist.LogNormal(0., 1.))
-    d1 = numpyro.sample('d1', dist.Beta(1., 1.))
+    d1 = numpyro.sample('d1', dist.Beta(1., 5.))
     ID0 = numpyro.sample(
         'ID0',
         dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)
@@ -188,23 +183,24 @@ def model(
     
     prev_stats, inc_stats = impl(x, EIR, etas)
     
-    numpyro.sample(
-        'obs_prev',
-        dist.Independent(
-            dist.Binomial(total_count=prev_N, probs=prev_stats, validate_args=True),
-            2
-        ),
-        obs=prev
-    )
-
-    numpyro.sample(
-        'obs_inc',
-        dist.Independent(
-            dist.Poisson(rate=jnp.maximum(inc_stats * person_risk_time, 1e-12)),
-            2
-        ),
-        obs=inc
-    )
+    with numpyro.handlers.scale(scale=alpha):
+        numpyro.sample(
+            'obs_prev',
+            dist.Independent(
+                dist.Binomial(total_count=prev_N, probs=prev_stats, validate_args=True),
+                2
+            ),
+            obs=prev
+        )
+    
+        numpyro.sample(
+            'obs_inc',
+            dist.Independent(
+                dist.Poisson(rate=jnp.maximum(inc_stats * person_risk_time, 1e-12)),
+                2
+            ),
+            obs=inc
+        )
 ```
 
 ```{code-cell} ipython3
@@ -233,7 +229,7 @@ prior_space = [
         'dm': DistStrategy(dist.TruncatedDistribution(dist.Normal(50., 20.), low=5., high=100.)),
         'kd': DistStrategy(dist.LogNormal(0., .25)),
         'ud': DistStrategy(dist.LogNormal(0., 1.)),
-        'd1': DistStrategy(dist.Beta(1., 1.)),
+        'd1': DistStrategy(dist.Beta(1., 5.)),
         'ID0': DistStrategy(dist.TruncatedDistribution(dist.Normal(25., 10.), low=5., high=50.)),
         'fd0': DistStrategy(dist.Beta(1., 1.)),
         'gd': DistStrategy(dist.LogNormal(0., 2.)),
@@ -263,8 +259,9 @@ from jax import pmap, tree_map
 import jax
 import pandas as pd
 
-train_samples = int(1e5)
+train_samples = int(5_000)
 device_count = len(jax.devices())
+n_epochs = 1_000
 ```
 
 ```{code-cell} ipython3
@@ -374,48 +371,6 @@ with jax.default_device(cpu_device):
 ```
 
 ```{code-cell} ipython3
-from flax import linen as nn
-
-class MLP(nn.Module):
-    """MLP. A multi layer perceptron
-    """
-
-    units: int
-    n_hidden: int
-    n_output: int
-    dropout_rate: float
-    batch_norm: bool
-    dtype = jnp.float64
-
-    @nn.compact
-    def __call__(self, x, training: bool):
-        denses = [nn.Dense(self.units, param_dtype=self.dtype) for _ in range(self.n_hidden)]
-        dropouts = [
-            nn.Dropout(rate=self.dropout_rate, deterministic=not training)
-            for _ in range(self.n_hidden)
-        ]
-        if self.batch_norm:
-            norms = [
-                nn.BatchNorm(use_running_average=not training)
-                for _ in range(self.n_hidden)
-            ]
-            layers = zip(denses, dropouts, norms)
-            for dense, dropout, norm in layers:
-                x = dense(x)
-                x = norm(x)
-                x = dropout(x)
-                x = nn.relu(x)
-        else:
-            layers = zip(denses, dropouts)
-            for dense, dropout in layers:
-                x = dense(x)
-                x = dropout(x)
-                x = nn.relu(x)
-
-        return nn.Dense(self.n_output)(x)
-```
-
-```{code-cell} ipython3
 def make_net(surrogate, y):
     y0 = tree_map(lambda x: x[0], y)
     y0_vec = surrogate.vectorise_output(y0)
@@ -424,7 +379,7 @@ def make_net(surrogate, y):
         n_hidden=2,
         n_output=jnp.size(y0_vec),
         dropout_rate=.2,
-        batch_norm=False
+        batch_norm=True
     )
 
 surrogate_lhs_full = make_surrogate(
@@ -445,27 +400,47 @@ train_state_lhs_full = train_surrogate(
     net_full,
     mse,
     key_i,
-    params_lhs_full
+    params_lhs_full,
+    epochs=n_epochs
 )
 ```
 
 ```{code-cell} ipython3
 key_i, key = random.split(key)
 with jax.default_device(cpu_device):
-    X_prior_full = sample(prior_train_space, train_samples, key_i)
+    X_prior_full = sample(prior_space, train_samples, key_i)
     y_prior_full = vmap(full_solution, in_axes=tree_map(lambda x: 0, X_prior_full))(*X_prior_full)
 ```
 
 ```{code-cell} ipython3
+def make_net(surrogate, y):
+    y0 = tree_map(lambda x: x[0], y)
+    y0_vec = surrogate.vectorise_output(y0)
+    return MLP(
+        units=256,
+        n_hidden=2,
+        n_output=jnp.size(y0_vec),
+        dropout_rate=.2,
+        batch_norm=True,
+        
+    )
+
 surrogate_prior_full = make_surrogate(
     X_prior_full,
     y_prior_full,
     y_min=y_min_full,
     y_max=y_max_full
 )
-key_i, key = random.split(key)
 
-params_prior_full = init_surrogate(key_i, surrogate_prior_full, net_full, X_prior_full)
+key_i, key = random.split(key)
+net_full = make_net(surrogate_prior_full, y_prior_full)
+
+params_prior_full = init_surrogate(
+    key_i,
+    surrogate_prior_full,
+    net_full,
+    X_prior_full
+)
 train_state_prior_full = train_surrogate(
     X_prior_full,
     y_prior_full,
@@ -473,7 +448,8 @@ train_state_prior_full = train_surrogate(
     net_full,
     mse,
     key_i,
-    params_prior_full
+    params_prior_full,
+    epochs=n_epochs
 )
 ```
 
@@ -495,7 +471,12 @@ surrogate_lhs_fixed = make_surrogate(
 net_fixed = make_net(surrogate_lhs_fixed, y_lhs_fixed)
 
 key_i, key = random.split(key)
-params_lhs_fixed = init_surrogate(key_i, surrogate_lhs_fixed, net_fixed, X_lhs_fixed)
+params_lhs_fixed = init_surrogate(
+    key_i,
+    surrogate_lhs_fixed,
+    net_fixed,
+    X_lhs_fixed
+)
 train_state_lhs_fixed = train_surrogate(
     X_lhs_fixed,
     y_lhs_fixed,
@@ -503,7 +484,8 @@ train_state_lhs_fixed = train_surrogate(
     net_fixed,
     mse,
     key_i,
-    params_lhs_fixed
+    params_lhs_fixed,
+    epochs=n_epochs
 )
 ```
 
@@ -527,19 +509,20 @@ train_state_prior_fixed = train_surrogate(
     net_fixed,
     mse,
     key_i,
-    params_prior_fixed
+    params_prior_fixed,
+    epochs=n_epochs
 )
 ```
 
 ```{code-cell} ipython3
 # Write function for validation set generation
-def apply_dmeq_surrogate(surrogate, net, net_params, params, eir, eta):
+def apply_dmeq_surrogate(surrogate, net, state, params, eir, eta):
     return tree_map(
         lambda leaf: leaf[0, 0],
         apply_surrogate(
             surrogate,
             net,
-            {'params': net_params},
+            {'params': state.params, 'batch_stats': state.batch_stats},
             tree_map(jnp.atleast_1d, [params, eir, eta])
         )
     )
@@ -621,7 +604,10 @@ def densities(p, model, impl):
 from jax import jacfwd
 
 def get_sensitivity(impl):
-    sensitivity = vmap(jacfwd(densities), in_axes=[tree_map(lambda _: 0, without_obs(prior)), None, None])(without_obs(prior), model, impl)
+    sensitivity = vmap(
+        jacfwd(densities),
+        in_axes=[tree_map(lambda _: 0, without_obs(prior)), None, None]
+    )(without_obs(prior), model, impl)
     return pd.concat([
         pd.DataFrame({
             'parameter': parameter,
@@ -634,22 +620,22 @@ def get_sensitivity(impl):
 
 ```{code-cell} ipython3
 sensitivity_prior_full = get_sensitivity(
-    surrogate_impl_full(surrogate_prior_full, net_full, train_state_prior_full.params)
+    surrogate_impl_full(surrogate_prior_full, net_full, train_state_prior_full)
 )
 ```
 
 ```{code-cell} ipython3
 sensitivity_prior_fixed = get_sensitivity(
-    surrogate_impl_fixed(surrogate_prior_fixed, net_fixed, train_state_prior_fixed.params)
+    surrogate_impl_fixed(surrogate_prior_fixed, net_fixed, train_state_prior_fixed)
 )
 sensitivity_lhs_fixed = get_sensitivity(
-    surrogate_impl_fixed(surrogate_lhs_fixed, net_fixed, train_state_lhs_fixed.params)
+    surrogate_impl_fixed(surrogate_lhs_fixed, net_fixed, train_state_lhs_fixed)
 )
 ```
 
 ```{code-cell} ipython3
 sensitivity_lhs_full = get_sensitivity(
-    surrogate_impl_full(surrogate_lhs_full, net_full, train_state_lhs_full.params)
+    surrogate_impl_full(surrogate_lhs_full, net_full, train_state_lhs_full)
 )
 ```
 
@@ -715,7 +701,7 @@ prior_full_prior_curves = get_curves(
         apply_dmeq_surrogate(
             surrogate_prior_full,
             net_full,
-            train_state_prior_full.params,
+            train_state_prior_full,
             sort_dict(p),
             e,
             a
@@ -835,7 +821,7 @@ def surrogate_posterior_fixed(surrogate, net, params, key):
 
 ```{code-cell} ipython3
 from numpyro import optim
-from numpyro.infer import SVI, Trace_ELBO
+from numpyro.infer import SVI, Trace_ELBO, RenyiELBO
 from numpyro.infer.autoguide import AutoBNAFNormal
 
 def surrogate_posterior_svi(key, impl):
@@ -874,107 +860,245 @@ def surrogate_posterior_full_svi(surrogate, net, params, key):
 ```
 
 ```{code-cell} ipython3
-lhs_full_mcmc = surrogate_posterior_full(
-    surrogate_lhs_full,
-    net_full,
-    train_state_lhs_full.params,
-    key
-)
-X_post_lhs_full = lhs_full_mcmc.get_samples()
+def posterior_EIR(params):
+    return params['EIR'], {k: v for k, v in params.items() if k != 'EIR'}
+
+def sample_full_from_posterior(params):
+    eir, params = posterior_EIR(params)
+    n = eir.shape[0]
+    X = [
+        tree_map(lambda leaf: jnp.repeat(leaf, n_sites), params),
+        jnp.reshape(eir, -1),
+        jnp.tile(etas, n)
+    ]
+    y = vmap(
+        lambda p, e, a: vmap(lambda _e, _a: full_solution(p, _e, _a))(e, a),
+        in_axes=[{k: 0 for k in params.keys()}, 0, None]
+    )(params, eir, etas)
+    y = tree_map(lambda leaf: leaf.reshape((-1, leaf.shape[-1])), y)
+    return X, y
+
+def surrogate_posterior_annealed_svi(surrogate, net, params, key):
+    rounds = 10
+    n_samples = train_samples
+    n_train_samples = 50_000
+
+    T = 1. / (0.45 ** jnp.arange(rounds))[::-1] #jnp.linspace(1000, 1, num=rounds)
+    
+    guide = AutoBNAFNormal(model, num_flows=5)
+
+    svi_state = None
+
+    training_samples = (X_prior_full, y_prior_full)
+
+    sample_sets = list()
+
+    #step_sizes = jnp.linspace(1e-4, 1e-5, num=rounds)
+    
+    #def optim_size(i):
+        #return step_sizes[i // n_train_samples]
+    
+    svi = SVI(
+        model,
+        guide,
+        optim.ClippedAdam(step_size=1e-4),
+        loss=Trace_ELBO(num_particles=8)
+    )
+    
+    for t in T:
+        impl = surrogate_impl_full(surrogate, net, params)
+    
+        # train SVI
+        sample_key, key = random.split(key, 2)
+        svi_result = svi.run(
+            sample_key,
+            n_train_samples,
+            stable_update=True,
+            init_state=svi_state,
+            true_EIRs=None,
+            prev=obs_prev,
+            inc=obs_inc,
+            impl=impl,
+            alpha=1./t
+        )
+        svi_params = svi_result.params
+        svi_state = svi_result.state
+    
+        # sample posterior
+        with jax.default_device(cpu_device):
+            post_key, key = random.split(key, 2)
+            posterior_samples = wo_latent(Predictive(
+                guide,
+                params=svi_params,
+                num_samples=n_samples
+            )(post_key))
+    
+            sample_sets.append(posterior_samples)
+
+        # retrain surrogate
+        if t != T[-1]:
+            with jax.default_device(cpu_device):
+                new_samples = sample_full_from_posterior(posterior_samples)
+                X, y = training_samples
+                X_new, y_new = new_samples
+                training_samples = (
+                    tree_map(lambda *x: jnp.concatenate(x), X, X_new),
+                    tree_map(lambda *y: jnp.concatenate(y), y, y_new),
+                )
+            train_key, key = random.split(key, 2)
+            params = train_surrogate(
+                training_samples[0],
+                training_samples[1],
+                surrogate,
+                net,
+                mse,
+                train_key,
+                params_prior_full,
+                epochs=n_epochs
+            )
+        
+
+    return sample_sets, params
 ```
 
 ```{code-cell} ipython3
-X_post_lhs_full_svi = surrogate_posterior_full_svi(
-    surrogate_lhs_full,
-    net_full,
-    train_state_lhs_full.params,
-    key
-)
+def surrogate_posterior_seq_svi(surrogate, net, params, key):
+    rounds = 10
+    n_samples = train_samples
+    n_train_samples = 50_000
+
+    training_samples = (X_prior_full, y_prior_full)
+
+    sample_sets = list()
+
+    guide = AutoBNAFNormal(model, num_flows=5)
+    
+    svi = SVI(
+        model,
+        guide,
+        optim.ClippedAdam(step_size=1e-4),
+        loss=Trace_ELBO(num_particles=8)
+    )
+
+    svi_state = None
+    
+    for i in range(rounds):
+        impl = surrogate_impl_full(surrogate, net, params)
+    
+        # train SVI
+        sample_key, key = random.split(key, 2)
+        svi_result = svi.run(
+            sample_key,
+            n_train_samples,
+            stable_update=True,
+            init_state=svi_state,
+            true_EIRs=None,
+            prev=obs_prev,
+            inc=obs_inc,
+            impl=impl
+        )
+        svi_params = svi_result.params
+        svi_state = svi_result.state
+    
+        # sample posterior
+        with jax.default_device(cpu_device):
+            post_key, key = random.split(key, 2)
+            posterior_samples = wo_latent(Predictive(
+                guide,
+                params=svi_params,
+                num_samples=n_samples
+            )(post_key))
+    
+            sample_sets.append(posterior_samples)
+
+        # retrain surrogate
+        if i != (rounds - 1):
+            with jax.default_device(cpu_device):
+                new_samples = sample_full_from_posterior(posterior_samples)
+                X, y = training_samples
+                X_new, y_new = new_samples
+                training_samples = (
+                    tree_map(lambda *x: jnp.concatenate(x), X, X_new),
+                    tree_map(lambda *y: jnp.concatenate(y), y, y_new),
+                )
+            train_key, key = random.split(key, 2)
+            params = train_surrogate(
+                training_samples[0],
+                training_samples[1],
+                surrogate,
+                net,
+                mse,
+                train_key,
+                params_prior_full,
+                epochs=n_epochs
+            )
+        
+
+    return sample_sets, params
 ```
 
 ```{code-cell} ipython3
 def wo_latent(X):
     return {k: v for k, v in X.items() if k != '_auto_latent'}
-
-tree_map(lambda x: x.mean(), wo_latent(X_post_lhs_full_svi))
-```
-
-```{code-cell} ipython3
-true_values
-```
-
-```{code-cell} ipython3
-lhs_full_mcmc.print_summary()
-```
-
-```{code-cell} ipython3
-y_post_lhs_full = prev_stats_posterior(X_post_lhs_full)
-y_post_lhs_full_hat = prev_stats_full_surrogate_posterior(
-    surrogate_lhs_full,
-    net_full,
-    train_state_lhs_full.params,
-    X_post_lhs_full
-)
-```
-
-```{code-cell} ipython3
-y_post_lhs_full_svi = prev_stats_posterior(X_post_lhs_full_svi)
-y_post_lhs_full_svi_hat = prev_stats_full_surrogate_posterior(
-    surrogate_lhs_full,
-    net_full,
-    train_state_lhs_full.params,
-    wo_latent(X_post_lhs_full_svi)
-)
-```
-
-```{code-cell} ipython3
-lhs_fixed_mcmc = surrogate_posterior_fixed(
-    surrogate_lhs_fixed,
-    net_fixed,
-    train_state_lhs_fixed.params,
-    key
-)
-X_post_lhs_fixed = lhs_fixed_mcmc.get_samples()
-y_post_lhs_fixed = prev_stats_posterior(X_post_lhs_fixed)
-y_post_lhs_fixed_hat = prev_stats_fixed_surrogate_posterior(
-    surrogate_lhs_fixed,
-    net_fixed,
-    train_state_lhs_fixed.params,
-    X_post_lhs_fixed
-)
 ```
 
 ```{code-cell} ipython3
 prior_full_mcmc = surrogate_posterior_full(
     surrogate_prior_full,
     net_full,
-    train_state_prior_full.params,
+    train_state_prior_full,
     key
 )
 X_post_prior_full = prior_full_mcmc.get_samples()
 y_post_prior_full = prev_stats_posterior(X_post_prior_full)
+```
+
+```{code-cell} ipython3
+prior_full_mcmc.print_summary()
+```
+
+```{code-cell} ipython3
 y_post_prior_full_hat = prev_stats_full_surrogate_posterior(
     surrogate_prior_full,
     net_full,
-    train_state_prior_full.params,
+    train_state_prior_full,
     X_post_prior_full
 )
 ```
 
 ```{code-cell} ipython3
-prior_fixed_mcmc = surrogate_posterior_fixed(
-    surrogate_prior_fixed,
-    net_fixed,
-    train_state_prior_fixed.params,
+X_post_prior_full_svi = surrogate_posterior_full_svi(
+    surrogate_prior_full,
+    net_full,
+    train_state_prior_full,
     key
 )
-X_post_prior_fixed = prior_fixed_mcmc.get_samples()
-y_post_prior_fixed = prev_stats_posterior(X_post_prior_fixed)
-y_post_prior_fixed_hat = prev_stats_fixed_surrogate_posterior(
-    surrogate_prior_fixed,
-    net_fixed,
-    train_state_prior_fixed.params,
-    X_post_prior_fixed
+```
+
+```{code-cell} ipython3
+X_post_prior_full_seq_svi, train_state_prior_full_seq = surrogate_posterior_seq_svi(
+    surrogate_prior_full,
+    net_full,
+    train_state_prior_full,
+    key
+)
+```
+
+```{code-cell} ipython3
+X_post_prior_full_annealed_svi, train_state_prior_full_annealed = surrogate_posterior_annealed_svi(
+    surrogate_prior_full,
+    net_full,
+    train_state_prior_full,
+    key
+)
+```
+
+```{code-cell} ipython3
+X_post_prior_full_annealed_svi_v2 = surrogate_posterior_annealed_svi(
+    surrogate_prior_full,
+    net_full,
+    train_state_prior_full,
+    key
 )
 ```
 
@@ -983,90 +1107,12 @@ y_val_prior = prev_stats_posterior(without_obs(prior))
 ```
 
 ```{code-cell} ipython3
-y_val_lhs_full_hat = prev_stats_full_surrogate_posterior(
-    surrogate_lhs_full,
-    net_full,
-    train_state_lhs_full.params,
-    without_obs(prior)
-)
-```
-
-```{code-cell} ipython3
-y_val_prior_fixed_hat = prev_stats_fixed_surrogate_posterior(
-    surrogate_prior_fixed,
-    net_fixed,
-    train_state_prior_fixed.params,
-    without_obs(prior)
-)
-```
-
-```{code-cell} ipython3
-y_val_prior_prior_full_hat = prev_stats_surrogate_batch(
+y_val_prior_prior_full_hat = prev_stats_full_surrogate_posterior(
     surrogate_prior_full,
-    prior_full_state,
-    sort_dict(without_obs(prior))
+    net_full,
+    train_state_prior_full,
+    without_obs(prior)
 )
-```
-
-```{code-cell} ipython3
-y_val_prior_comb_full_hat = prev_stats_surrogate_batch(surrogate_comb_full, comb_full_state, sort_dict(without_obs(prior)))
-```
-
-```{code-cell} ipython3
-y_val_prior_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fixed, params_prior_fixed, sort_dict(without_obs(prior)))
-
-y_val_lhs_prior_full_hat = prev_stats_surrogate_batch(surrogate_prior_full, params_prior_full, X_val_lhs)
-y_val_lhs_prior_fixed_hat = prev_stats_fixed_surrogate_batch(surrogate_prior_fixed, params_prior_fixed, X_val_lhs)
-```
-
-```{code-cell} ipython3
-from numpyro.infer import log_likelihood
-
-lhs_full_svi_ll = log_likelihood(
-    model,
-    X_post_lhs_full_svi,
-    prev=obs_prev,
-    inc=obs_inc
-)
-
-lhs_full_ll = log_likelihood(
-    model,
-    X_post_lhs_full,
-    prev=obs_prev,
-    inc=obs_inc
-)
-```
-
-```{code-cell} ipython3
-tree_map(jnp.mean, lhs_full_ll)
-```
-
-```{code-cell} ipython3
-tree_map(jnp.mean, lhs_full_svi_ll)
-```
-
-```{code-cell} ipython3
-from numpyro.infer.util import log_density
-from numpyro import handlers
-
-def densities(p, pp):
-    _p = {k: v[0] if k == 'EIR' else v for k, v in without_obs(p).items()}
-    ld = log_density(handlers.seed(model, key), [], {}, _p)
-    return pd.DataFrame(
-        jnp.concatenate(
-            [
-                jnp.mean(ld[1]['obs_prev']['fn'].base_dist.log_prob(pp['obs_prev']), axis=0),
-                jnp.mean(ld[1]['obs_inc']['fn'].base_dist.log_prob(pp['obs_inc']), axis=0)
-            ],
-            axis=1
-        ),
-        columns=['prev_2_10', 'prev_10+', 'inc_0_5', 'inc_5_15', 'inc_15+']
-    ).assign(EIR=EIRs)
-densities(true_values, lhs_full_svi_pp)
-```
-
-```{code-cell} ipython3
-tree_map(lambda x: jnp.mean(x, axis=0), ld)
 ```
 
 ```{code-cell} ipython3
@@ -1078,20 +1124,20 @@ def _to_arviz_dict(samples):
         for k, v in samples.items()
     }
 
-lhs_full_svi_pp = Predictive(model, X_post_lhs_full_svi)(key_i)
-lhs_full_svi_idata = az.from_dict(
-    posterior=_to_arviz_dict(X_post_lhs_full_svi),
-    posterior_predictive=_to_arviz_dict(lhs_full_svi_pp),
+prior_full_svi_pp = Predictive(model, X_post_prior_full_svi)(key_i)
+prior_full_svi_idata = az.from_dict(
+    posterior=_to_arviz_dict(X_post_prior_full_svi),
+    posterior_predictive=_to_arviz_dict(prior_full_svi_pp),
     observed_data={
         'obs_prev': obs_prev,
         'obs_inc': obs_inc
     }
 )
 
-lhs_full_pp = Predictive(model, X_post_lhs_full)(key_i)
-lhs_full_idata = az.from_dict(
-    posterior=_to_arviz_dict(X_post_lhs_full),
-    posterior_predictive=_to_arviz_dict(lhs_full_pp),
+prior_full_pp = Predictive(model, X_post_prior_full)(key_i)
+prior_full_idata = az.from_dict(
+    posterior=_to_arviz_dict(X_post_prior_full),
+    posterior_predictive=_to_arviz_dict(prior_full_pp),
     observed_data={
         'obs_prev': obs_prev,
         'obs_inc': obs_inc
@@ -1100,48 +1146,94 @@ lhs_full_idata = az.from_dict(
 ```
 
 ```{code-cell} ipython3
-az.plot_ppc(
-    lhs_full_idata,
-    flatten=[],
-    kind='scatter'
-)
+def sq_euclidean_dist(x, y):
+    if len(x.shape) == 1:
+        x = x.reshape(x.shape[0], 1)
+    if len(y.shape) == 1:
+        y = y.reshape(y.shape[0], 1)
+
+    assert x.shape[-1] == y.shape[-1]
+
+    dist = jnp.sum(
+            jnp.square(x), axis=-1
+            )[..., None] + jnp.sum(
+                    jnp.square(y), axis=-1
+                    )[..., None].T - 2 * jnp.dot(x, y.T)
+    return dist
+
+class SquaredExponential:
+    """
+    Squared exponential kernel.
+    K(x1, x2) = var * exp(-0.5 * ||x1 - x2||^2/l**2)
+    """
+
+    def __init__(self, lengthscale=1., variance=1.):
+        self.lengthscale = lengthscale
+        self.variance = variance
+
+    def __call__(self, x1, x2):
+        assert x1.shape[-1] == x2.shape[-1]
+        dist = sq_euclidean_dist(x1/self.lengthscale, x2/self.lengthscale)
+        k = self.variance * jnp.exp(-0.5 * dist)
+        assert k.shape == (x1.shape[0], x2.shape[0])
+        return k
+
+
+def squared_mmd(X, Y, kernel=SquaredExponential()): 
+    X = jnp.array(X)
+    Y = jnp.array(Y)
+    K_XX = kernel(X, X)
+    K_YY = kernel(Y, Y)
+    K_XY = kernel(X, Y)
+
+    n = K_XX.shape[0]
+    m = K_YY.shape[0]
+
+    mmd_squared = (
+            jnp.sum(K_XX) - jnp.trace(K_XX)
+            ) / (
+                    (n * (n - 1)) +
+                    (jnp.sum(K_YY) - jnp.trace(K_YY)) / (m * (m - 1)) -
+                    2 * jnp.sum(K_XY) / (m * n)
+                    )
+
+    return mmd_squared
 ```
 
 ```{code-cell} ipython3
-az.plot_ppc(
-    lhs_full_svi_idata,
-    flatten=[],
-    kind='scatter'
-)
+from jax.tree_util import tree_leaves
+
+def vectorise_posterior(X):
+    return jnp.concatenate(
+        [
+            l if l.ndim == 2 else l[...,None]
+            for l in tree_leaves(X)
+        ],
+        axis=1
+    )
+
+X_vec_svi = vectorise_posterior(wo_latent(X_post_prior_full_svi))
+X_vec_mcmc = vectorise_posterior(X_post_prior_full)
 ```
 
 ```{code-cell} ipython3
-az.plot_bpv(
-    lhs_full_idata,
-    kind='t_stat'
-)
+squared_mmd(X_vec_svi, X_vec_mcmc, kernel=SquaredExponential(10., 1.))
 ```
 
 ```{code-cell} ipython3
-lhs_full_svi_idata.observed_data.obs_prev
+squared_mmd(X_vec_svi, X_vec_mcmc, kernel=SquaredExponential(10., 1.))
 ```
 
 ```{code-cell} ipython3
-lhs_full_svi_idata.posterior_predictive.obs_prev
+squared_mmd(X_vec_svi, X_vec_svi, kernel=SquaredExponential(10., 1.))
 ```
 
 ```{code-cell} ipython3
-az.plot_bpv(
-    lhs_full_idata,
-    kind='u_value'
-)
+az.plot_bpv(prior_full_idata, kind='p_value')
 ```
 
 ```{code-cell} ipython3
-az.plot_bpv(
-    lhs_full_svi_idata,
-    kind='u_value'
-)
+az.plot_bpv(prior_full_svi_idata, kind='p_value')
 ```
 
 ```{code-cell} ipython3
@@ -1185,204 +1277,6 @@ plot_predictive_error(y_post_prior_full, y_post_prior_full_hat)
 ```
 
 ```{code-cell} ipython3
-plot_predictive_error(y_post_prior_fixed, y_post_prior_fixed_hat)
-```
-
-```{code-cell} ipython3
-plot_predictive_error(y_post_lhs_fixed, y_post_lhs_fixed_hat)
-```
-
-```{code-cell} ipython3
-def approximation_error(exps, labels, ys, y_hats, std_surrogate):
-    y_labels = ['prev2-10', 'prev10+', 'inc0-5', 'inc5-15', 'inc15+']
-    ys = [jnp.concatenate(y, axis=2) for y in ys]
-    y_hats = [jnp.concatenate(y_hat, axis=2) for y_hat in y_hats]
-    
-    return pd.DataFrame([
-        {
-            'mse': jnp.mean(jnp.square(y - y_hat)[:, i, j]),
-            'RE': jnp.mean(jnp.abs(y - y_hat)[:, i, j] / y[:, i, j]),
-            'EIR': float(EIRs[i]),
-            'output': y_labels[j],
-            'test_set': label,
-            'experiment': exp
-        }
-        for i in range(len(EIRs))
-        for j in range(len(y_labels))
-        for exp, label, y, y_hat in zip(exps, labels, ys, y_hats)
-    ])
-
-def stand_approximation_error(exps, labels, ys, y_hats, std_surrogate):
-    ys = [
-        vmap(std_surrogate.vectorise_output, in_axes=[tla(y)])(y)
-        for y in ys
-    ]
-    y_hats = [
-        vmap(std_surrogate.vectorise_output, in_axes=[tla(y_hat)])(y_hat)
-        for y_hat in y_hats
-    ]
-    
-    return pd.DataFrame([
-        {
-            'mse': jnp.mean(jnp.square(y - y_hat)),
-            'test_set': label,
-            'experiment': exp
-        }
-        for exp, label, y, y_hat in zip(exps, labels, ys, y_hats)
-    ])
-```
-
-```{code-cell} ipython3
-stand_approximation_error(
-    ['lhs_full', 'lhs_full'],
-    ['prior', 'posterior'],
-    [y_val_prior, y_post_lhs_full_svi],
-    [y_val_lhs_full_hat, y_post_lhs_full_svi_hat],
-    surrogate_lhs_fixed
-)
-```
-
-```{code-cell} ipython3
-approximation_error(
-    ['lhs_full', 'lhs_full'],
-    ['prior', 'posterior'],
-    [y_val_prior, y_post_lhs_full_svi],
-    [y_val_lhs_full_hat, y_post_lhs_full_svi_hat]
-)
-```
-
-```{code-cell} ipython3
-# TODO: why are these so far?
-```
-
-```{code-cell} ipython3
-labels, posteriors = ['lhs_full'], [X_post_lhs_full]
-prev_columns = ['prev_2_10', 'prev_10+']
-inc_columns = ['inc_0_5', 'inc_5_15', 'inc_15+']
-keys = random.split(key, len(posteriors))
-posterior_predictives = [
-    Predictive(model, p)(key_i)
-    for key_i, p in zip(keys, posteriors)
-]
-label, pp = list(zip(labels, posterior_predictives))[0]
-pd.concat([
-    pd.DataFrame(
-        jnp.mean(jnp.square(obs_inc - pp['obs_inc']), axis=0),
-        columns=inc_columns
-    ).assign(EIR=EIRs),
-    pd.DataFrame(
-        jnp.mean(jnp.square(obs_prev - pp['obs_prev']), axis=0),
-        columns=prev_columns
-    ).assign(EIR=EIRs),
-], axis=1).assign(experiment=label)
-```
-
-```{code-cell} ipython3
-def stand_mspe(key, labels, posteriors, std_surrogate):
-    keys = random.split(key, len(posteriors))
-    y = std_surrogate.vectorise_output((obs_prev, obs_inc))
-    pps = [
-        Predictive(model, p)(key_i)
-        for key_i, p in zip(keys, posteriors)
-    ]
-    std_pps = [
-        vmap(std_surrogate.vectorise_output, in_axes=[(0, 0)])((pp['obs_prev'], pp['obs_inc']))
-        for pp in pps
-    ]
-    return pd.DataFrame([
-        {'mspe': jnp.mean(jnp.square(y - pp)), 'experiment': label}
-        for label, pp in zip(labels, std_pps)
-    ])
-
-stand_mspe(key, ['lhs_full_svi'], [X_post_lhs_full_svi], surrogate_lhs_fixed)
-```
-
-```{code-cell} ipython3
-def mspe(key, labels, posteriors):
-    prev_columns = ['prev_2_10', 'prev_10+']
-    inc_columns = ['inc_0_5', 'inc_5_15', 'inc_15+']
-    keys = random.split(key, len(posteriors))
-    posterior_predictives = [
-        Predictive(model, p)(key_i)
-        for key_i, p in zip(keys, posteriors)
-    ]
-    return pd.concat([
-        pd.concat([
-            pd.DataFrame(
-                jnp.mean(jnp.square(obs_inc - pp['obs_inc']), axis=0),
-                columns=inc_columns
-            ),
-            pd.DataFrame(
-                jnp.mean(jnp.square(obs_prev - pp['obs_prev']), axis=0),
-                columns=prev_columns
-            ),
-        ], axis=1).assign(experiment=label)
-        for label, pp in zip(labels, posterior_predictives)
-    ])
-
-mspe(key, ['lhs_full', 'lhs_full_svi'], [X_post_lhs_full, X_post_lhs_full_svi])
-```
-
-```{code-cell} ipython3
-print(approximation_error(
-    ['lhs_full'] * 3 + ['lhs_fixed'] * 3 + ['prior_full'] * 3 + ['prior_fixed'] * 3,
-    ['prior', 'lhs', 'posterior'] * 4,
-    [y_val_prior, y_val_lhs, y_post_lhs_full, y_val_prior, y_val_lhs, y_post_lhs_fixed, y_val_prior, y_val_lhs, y_post_prior_full, y_val_prior, y_val_lhs, y_post_prior_fixed],
-    [y_val_prior_full_hat, y_val_lhs_full_hat, y_post_lhs_full_hat, y_val_prior_fixed_hat, y_val_lhs_fixed_hat, y_post_lhs_fixed_hat,
-     y_val_prior_prior_full_hat, y_val_lhs_prior_full_hat, y_post_prior_full_hat, y_val_prior_prior_fixed_hat, y_val_lhs_prior_fixed_hat, y_post_prior_fixed_hat]
-).groupby(['experiment', 'test_set'], as_index=False).agg({'RE': 'mean'}).pivot(index='experiment', columns='test_set', values='RE').to_latex(float_format="{:0.2f}".format))#, 'EIR', 'output']).mean()
-```
-
-```{code-cell} ipython3
-jnp.mean(jnp.abs(jnp.concatenate(y_val_prior, axis=2) - jnp.concatenate(y_val_prior_comb_full_hat, axis=2)) / jnp.concatenate(y_val_prior, axis=2))
-```
-
-```{code-cell} ipython3
-jnp.mean(jnp.abs(jnp.concatenate(y_post_comb_full, axis=2) - jnp.concatenate(y_post_comb_full_hat, axis=2)) / jnp.concatenate(y_post_comb_full, axis=2))
-```
-
-```{code-cell} ipython3
-jnp.mean(jnp.abs(jnp.concatenate(y_post_prior_full, axis=2) - jnp.concatenate(y_post_prior_full_hat, axis=2)) / jnp.concatenate(y_post_prior_full, axis=2))
-```
-
-```{code-cell} ipython3
-approximation_error(
-    ['prior_full'],
-    ['prior'],
-    [y_val_prior],
-    [y_val_prior_prior_full_hat]
-).groupby(['output', 'EIR']).agg({'RE': 'mean', 'L1': 'mean'})
-```
-
-```{code-cell} ipython3
-n_samples = 100
-n_warmup = 100
-mcmc = MCMC(
-    NUTS(model),
-    num_samples=n_samples,
-    num_warmup=n_warmup,
-    num_chains=n_chains,
-    chain_method='vectorized'
-)
-mcmc.run(key, None, obs_prev, obs_inc)
-mcmc.print_summary(prob=0.7)
-```
-
-```{code-cell} ipython3
-import pickle
-with open('chapter_2_mcmc_underlying.pkl', 'rb') as f:
-    mcmc = pickle.load(f)
-```
-
-```{code-cell} ipython3
-posterior_samples = mcmc.get_samples()
-posterior_predictive = Predictive(
-    model,
-    posterior_samples
-)(key, obs_prev, obs_inc)
-```
-
-```{code-cell} ipython3
 prior_full_samples = prior_full_mcmc.get_samples()
 prior_full_predictive = Predictive(
     model,
@@ -1391,196 +1285,9 @@ prior_full_predictive = Predictive(
 ```
 
 ```{code-cell} ipython3
-lhs_fixed_samples = lhs_fixed_mcmc.get_samples()
-lhs_fixed_predictive = Predictive(
-    model,
-    lhs_fixed_samples
-)(key, obs_prev, obs_inc)
-```
-
-```{code-cell} ipython3
-from scipy.stats import ks_2samp
-sample_keys = list(posterior_samples.keys())
-ks_data = pd.concat([
-    pd.DataFrame([
-        {
-            'experiment': name,
-            'variable': k,
-            'statistic': ks_2samp(posterior_samples[k], posterior[k]).statistic,
-            #'p-value': ks_2samp(posterior_samples[k], posterior[k]).pvalue,
-            'mean': float(jnp.mean(posterior[k])),
-            'true_mean': float(jnp.mean(posterior_samples[k])),
-        }
-        for k in sample_keys
-        for name, posterior in [
-            #('prior_fixed', prior_fixed_mcmc.get_samples()),
-            ('prior_full', prior_full_mcmc.get_samples()),
-            ('lhs_fixed', lhs_fixed_mcmc.get_samples()),
-            #('lhs_full', lhs_full_mcmc.get_samples()),
-            #('comb_full', comb_full_mcmc.get_samples())
-        ]
-        if k != 'EIR'
-    ]),
-    pd.DataFrame([
-        {
-            'experiment': name,
-            'variable': f'EIR_{i}',
-            'statistic': ks_2samp(posterior_samples['EIR'][:,i], posterior['EIR'][:,i]).statistic,
-            #'p-value': ks_2samp(posterior_samples['EIR'][:,i], posterior['EIR'][:,i]).pvalue,
-            'mean': float(jnp.mean(posterior['EIR'][:,i])),
-            'true_mean': float(jnp.mean(posterior_samples['EIR'][:,i]))
-        }
-        for name, posterior in [
-            #('prior_fixed', prior_fixed_mcmc.get_samples()),
-            ('prior_full', prior_full_mcmc.get_samples()),
-            #('comb_full', comb_full_mcmc.get_samples())
-            ('lhs_fixed', lhs_fixed_mcmc.get_samples()),
-            #('lhs_full', lhs_full_mcmc.get_samples())
-            #('comb_full', comb_full_mcmc.get_samples())
-        ]
-        for i in range(posterior['EIR'].shape[1])
-    ])
-])
-```
-
-```{code-cell} ipython3
-ks_data.pivot(
-    columns='experiment',
-    index='variable'
-).swaplevel(axis='columns').sort_index(axis=1, level=0).loc[
-    [f'EIR_{i}' for i in range(n_sites)] +
-    [
-        # Pre-erythrocytic immunity
-        'kb',
-        'ub',
-        'b0',
-        'IB0',
-        
-        # Clinical immunity
-        'kc',
-        'uc',
-        'phi0',
-        'phi1',
-        'IC0',
-        'PM',
-        'dm',
-        
-        # Detection immunity
-        'kd',
-        'ud',
-        'd1',
-        'ID0',
-        'fd0',
-        'gd',
-        'ad0',
-        'rU',
-    ]
-]
-```
-
-```{code-cell} ipython3
-print(ks_data.pivot(columns='experiment', index='variable').swaplevel(axis='columns').sort_index(axis=1, level=0).loc[[
-        # Pre-erythrocytic immunity
-    'kb',
-    'ub',
-    'b0',
-    'IB0',
-    
-    # Clinical immunity
-    'kc',
-    'uc',
-    'phi0',
-    'phi1',
-    'IC0',
-    'PM',
-    'dm',
-    
-    # Detection immunity
-    'kd',
-    'ud',
-    'd1',
-    'ID0',
-    'fd0',
-    'gd',
-    'ad0',
-    'rU',
-]].style.format(precision=2).to_latex())
-```
-
-```{code-cell} ipython3
-from flax.training import orbax_utils
-import orbax.checkpoint
-
-def save_model(name, surrogate, params):
-    ckpt = {
-        'surrogate': surrogate,
-        'params': params
-    }
-    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-    save_args = orbax_utils.save_args_from_target(ckpt)
-    orbax_checkpointer.save(f'orbax/{name}', ckpt, force=True, save_args=save_args)
-    
-save_model(f'prior_fixed_{train_samples}', surrogate_prior_fixed, params_prior_fixed)
-```
-
-```{code-cell} ipython3
-pyro_data = az.from_numpyro(
-    mcmc,
-    prior=prior,
-    posterior_predictive=posterior_predictive
-)
-pyro_data_surrogate = az.from_numpyro(
-    prior_full_mcmc,
-    prior=prior,
-    posterior_predictive=comb_full_predictive
-)
-```
-
-```{code-cell} ipython3
-az.rcParams["plot.max_subplots"] = 200
-keys = list(pyro_data.prior.data_vars.keys())
-axs = az.plot_dist_comparison(pyro_data)
-axs = az.plot_dist_comparison(
-    pyro_data_surrogate,
-    ax=axs
-)
-
-for i, key in enumerate(keys):
-    if key == 'EIR':
-        for j in range(n_sites):
-            axs[j, 2].vlines(
-                EIRs[j],
-                0,
-                axs[j, 2].get_ylim()[1],
-                color = 'red',
-                linestyle = 'dashed'
-            )
-    else:
-        j = i + n_sites - 1
-        axs[j, 2].vlines(
-            true_values[key][0],
-            0,
-            axs[j, 2].get_ylim()[1],
-            color = 'red',
-            linestyle = 'dashed'
-        )
-        
-for i in range(axs.shape[0]):
-    s_prior_lines = [axs[i, 0].get_lines()[1], axs[i, 2].get_lines()[2]]
-    s_posterior_lines = [axs[i, 1].get_lines()[1], axs[i, 2].get_lines()[3]]
-    for s_prior_line in s_prior_lines:
-        s_prior_line.set_color('C3')
-        s_prior_line.set_label('surrogate prior')
-    for s_posterior_line in s_posterior_lines:
-        s_posterior_line.set_color('C4')
-        s_posterior_line.set_label('surrogate posterior')
-    
-    for j in range(3):
-        axs[i, j].legend()
-```
-
-```{code-cell} ipython3
-posterior_curves_surrogate = get_curves(prior_full_samples, EIRs, etas)
+with jax.default_device(cpu_device):
+    #NUTS_posterior_curves = get_curves(prior_full_samples, EIRs, etas)
+    SVI_posterior_curves = get_curves(X_post_prior_full_annealed_svi[8], EIRs, etas)
 ```
 
 ```{code-cell} ipython3
@@ -1592,7 +1299,8 @@ for i in range(len(EIRs)):
     )
     axs[0, i].xaxis.set_label_position('top')
     for imm_i, imm in enumerate([f'prob_{l}' for l in imm_labels]):
-        axs[imm_i, i].plot(posterior_curves_surrogate[imm][i, :n_curves, :].T, color='r', alpha=.01)
+        #axs[imm_i, i].plot(NUTS_posterior_curves[imm][i, :n_curves, :].T, color='r', alpha=.01)
+        axs[imm_i, i].plot(SVI_posterior_curves[imm][i, :n_curves, :].T, color='g', alpha=.01)
         axs[imm_i, i].plot(true_curves[imm][i, 0, :].T)
         axs[imm_i, 0].set_ylabel(f'prob. {imm_labels[imm_i]}')
         
@@ -1609,7 +1317,8 @@ for i in range(len(EIRs)):
     for prev_i, prev in enumerate(prev_labels):
         axs[0, i].set_xlabel(f'EIR: {EIRs[i]}')
         axs[0, i].xaxis.set_label_position('top')
-        axs[prev_i, i].plot(posterior_curves_surrogate[prev][i, :n_curves, :].T / posterior_curves_surrogate['prop'][i, :n_curves, :].T, color='r', alpha=.01)
+        #axs[prev_i, i].plot(NUTS_posterior_curves[prev][i, :n_curves, :].T / NUTS_posterior_curves['prop'][i, :n_curves, :].T, color='r', alpha=.01)
+        axs[prev_i, i].plot(SVI_posterior_curves[prev][i, :n_curves, :].T / SVI_posterior_curves['prop'][i, :n_curves, :].T, color='g', alpha=.01)
         axs[prev_i, i].plot(true_curves[prev][i, 0, :] / true_curves['prop'][i, 0, :])
         axs[prev_i, 0].set_ylabel(prev)
         
@@ -1643,8 +1352,23 @@ def get_batch_imm_curves(params):
 ```
 
 ```{code-cell} ipython3
-posterior_imm_curves = get_batch_imm_curves(X_post_lhs_full_svi)
 true_imm_curves = get_batch_imm_curves(without_obs(true_values))
+```
+
+```{code-cell} ipython3
+posterior_imm_curves = get_batch_imm_curves(X_post_prior_full)
+```
+
+```{code-cell} ipython3
+posterior_imm_curves_svi = get_batch_imm_curves(X_post_prior_full_svi)
+```
+
+```{code-cell} ipython3
+posterior_imm_curves_svi = get_batch_imm_curves(X_post_prior_full_annealed_svi[8])
+```
+
+```{code-cell} ipython3
+posterior_imm_curves_svi = get_batch_imm_curves(X_post_prior_full_seq_svi[5])
 ```
 
 ```{code-cell} ipython3
@@ -1653,7 +1377,8 @@ fig, axs = plt.subplots(1, 3)
 imm_labels = ['prob_b', 'prob_c', 'prob_d']
 
 for imm_i, imm in enumerate(imm_labels):
-    axs[imm_i].plot(posterior_imm_curves[imm][:n_curves, :].T, color='r', alpha=.1)
+    #axs[imm_i].plot(posterior_imm_curves[imm][:n_curves, :].T, color='r', alpha=.1)
+    axs[imm_i].plot(posterior_imm_curves_svi[imm][:n_curves, :].T, color='g', alpha=.1)
     axs[imm_i].plot(true_imm_curves[imm][0, :])
     axs[imm_i].set_ylabel(imm)
         
@@ -1795,14 +1520,11 @@ timings = pd.melt(
 ```
 
 ```{code-cell} ipython3
-timings
-```
-
-```{code-cell} ipython3
 sns.lineplot(
-    timings[(timings.task == 'sampling') & (timings['round'] == 0)],
+    timings[(timings.task.isin(['sampling', 'training'])) & (timings['round'] == 0)],
     x="samples",
-    y="time"
+    y="time",
+    hue='task'
 )
 ```
 
@@ -1860,9 +1582,10 @@ g = sns.FacetGrid(
     col='samples',
     row="sampler",
     hue="experiments",
-    margin_titles=True
+    margin_titles=True,
+    sharey=False
 )
-g.map(sns.scatterplot, "round", "log_likelihood")
+g.map(sns.lineplot, "round", "log_likelihood")
 for (e, s), ax in g.axes_dict.items():
     #ax.set_yscale('log')
     y = u_ll[u_ll.obs == 'obs_inc'].log_likelihood.iloc[0]
@@ -1917,7 +1640,8 @@ g = sns.FacetGrid(
     col='samples',
     row="sampler",
     hue="experiment",
-    margin_titles=True
+    margin_titles=True,
+    sharey=False
 )
 g.map(sns.lineplot, "round", "log_likelihood")
 for (e, s), ax in g.axes_dict.items():
@@ -1936,6 +1660,7 @@ summaries = pd.concat([
 ])
 summaries = summaries[summaries['index'] != 'EIR']
 summaries.r_hat = pd.to_numeric(summaries.r_hat)
+summaries.n_eff = pd.to_numeric(summaries.n_eff)
 ```
 
 ```{code-cell} ipython3
@@ -1947,6 +1672,18 @@ g = sns.FacetGrid(
     sharey=False
 )
 g.map(sns.lineplot, "round", "r_hat")
+g.add_legend()
+```
+
+```{code-cell} ipython3
+g = sns.FacetGrid(
+    summaries,
+    col='samples',
+    hue="experiment",
+    margin_titles=True,
+    sharey=False
+)
+g.map(sns.lineplot, "round", "n_eff")
 g.add_legend()
 ```
 
