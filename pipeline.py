@@ -10,6 +10,7 @@ import jax.numpy as jnp
 from jax import random, jit, vmap
 import dmeq
 from mox.sampling import LHSStrategy
+from mox.utils import tree_to_vector
 import numpyro
 from numpyro.infer import MCMC, NUTS, Predictive, log_likelihood
 from numpyro.infer.util import log_density 
@@ -31,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-out_dir = 'outputs/v1'
+out_dir = 'outputs/v3'
 
 def timing(f):
     def wrap(*args, **kw):
@@ -44,7 +45,10 @@ def timing(f):
 key = random.PRNGKey(42)
 cpu_device = jax.devices('cpu')[0]
 n_chains = 10
+
 epochs = 1000
+n_svi_train_samples = 50_000
+n_surrogate_warmup = 500
 n_rounds = 5
 
 def full_solution(params, eir, eta):
@@ -92,7 +96,7 @@ prev_stats_multisite = vmap(
 # In[9]:
 
 
-EIRs = jnp.array([0.05, 3.9, 15., 20., 100., 150., 418.])
+EIRs = jnp.array([3.9, 15., 20., 100., 150., 418.]) #jnp.array([0.05, 3.9, 15., 20., 100., 150., 418.])
 n_sites = EIRs.shape[0]
 key, key_i = random.split(key)
 etas = 1. / random.uniform(key_i, shape=(n_sites,), minval=40*365, maxval=100*365, dtype=jnp.float64)
@@ -143,7 +147,13 @@ prior_parameter_space = [
 # In[12]:
 
 
-def model(true_EIRs=None, prev=None, inc=None, impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution)):
+def model(
+    true_EIRs=None,
+    prev=None,
+    inc=None,
+    impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution),
+    alpha=1.
+    ):
     with numpyro.plate('sites', n_sites):
         EIR = numpyro.sample('EIR', dist.Uniform(0., 500.), obs=true_EIRs)
     
@@ -202,23 +212,24 @@ def model(true_EIRs=None, prev=None, inc=None, impl=lambda p, e, a: prev_stats_m
     
     prev_stats, inc_stats = impl(x, EIR, etas)
     
-    numpyro.sample(
-        'obs_prev',
-        dist.Independent(
-            dist.Binomial(total_count=prev_N, probs=prev_stats, validate_args=True),
-            2
-        ),
-        obs=prev
-    )
+    with numpyro.handlers.scale(scale=alpha):
+        numpyro.sample(
+            'obs_prev',
+            dist.Independent(
+                dist.Binomial(total_count=prev_N, probs=prev_stats, validate_args=True),
+                2
+            ),
+            obs=prev
+        )
 
-    numpyro.sample(
-        'obs_inc',
-        dist.Independent(
-            dist.Poisson(rate=jnp.maximum(inc_stats * person_risk_time, 1e-12)),
-            2
-        ),
-        obs=inc
-    )
+        numpyro.sample(
+            'obs_inc',
+            dist.Independent(
+                dist.Poisson(rate=jnp.maximum(inc_stats * person_risk_time, 1e-12)),
+                2
+            ),
+            obs=inc
+        )
 
 
 logger.info('Making truth')
@@ -496,11 +507,10 @@ def surrogate_impl_fixed(surrogate, net, net_params):
 def surrogate_posterior(key, impl, init_params, n_samples):
     # Initialise MCMC
     kernel = NUTS(model, forward_mode_differentiation=True) # Reverse mode has lead to initialisation errors
-    n_warmup = 500
     mcmc = MCMC(
         kernel,
         num_samples=n_samples // n_chains,
-        num_warmup=n_warmup,
+        num_warmup=n_surrogate_warmup,
         num_chains=n_chains,
         chain_method='vectorized' #pmap leads to segfault for some reason (https://github.com/google/jax/issues/13858)
     )
@@ -526,20 +536,19 @@ def wo_latent(X):
         if k != '_auto_latent'
     }
 
-def surrogate_posterior_svi(key, svi, guide, svi_state, impl, n_samples):
-    n_train_samples = 50_000
-
+def surrogate_posterior_svi(key, svi, guide, svi_state, impl, n_samples, alpha):
     # train SVI
     sample_key, key = random.split(key, 2)
     svi_result = svi.run(
         sample_key,
-        n_train_samples,
+        n_svi_train_samples,
         init_state=svi_state,
         stable_update=True,
         true_EIRs=None,
         prev=obs_prev,
         inc=obs_inc,
-        impl=impl
+        impl=impl,
+        alpha=alpha
     )
     svi_params = svi_result.params
 
@@ -578,16 +587,30 @@ def approximation_error(exps, labels, ys, y_hats):
         for exp, label, y, y_hat in zip(exps, labels, ys, y_hats)
     ])
 
-def stand_approximation_error(exps, labels, ys, y_hats, std_surrogate):
+def stand_approximation_error(exps, labels, ys, y_hats):
+    means = tree_map(jnp.mean, ys)
+    stds = tree_map(jnp.std, ys)
+    ys = tree_map(
+        lambda y, mean, std: (y - mean) / std,
+        ys,
+        means,
+        stds
+    )
+    y_hats = tree_map(
+        lambda y, mean, std: (y - mean) / std,
+        y_hats,
+        means,
+        stds
+    )
     ys = [
-        vmap(std_surrogate.vectorise_output, in_axes=[tla(y)])(y)
+        vmap(tree_to_vector, in_axes=[tla(y)])(y)
         for y in ys
     ]
     y_hats = [
-        vmap(std_surrogate.vectorise_output, in_axes=[tla(y_hat)])(y_hat)
+        vmap(tree_to_vector, in_axes=[tla(y_hat)])(y_hat)
         for y_hat in y_hats
     ]
-    
+
     return pd.DataFrame([
         {
             'mse': jnp.mean(jnp.square(y - y_hat)),
@@ -748,7 +771,8 @@ def perform_svi(
     svi,
     guide,
     svi_state,
-    n_samples
+    n_samples,
+    alpha
     ):
     surrogate, net = obj
     t, (X_post, svi_state, losses) = timing(surrogate_posterior_svi)(
@@ -761,7 +785,8 @@ def perform_svi(
             net,
             train_state.params
         ),
-        n_samples
+        n_samples,
+        alpha
     )
     y_post = prev_stats_posterior(X_post)
     y_post_hat = val_helper(
@@ -841,7 +866,234 @@ def squared_mmd(X, Y, kernel=SquaredExponential(10., 1.)):
 
     return mmd_squared
 
-def run_pipeline(train_samples, key):
+def run_pipeline(experiment, method, train_samples, key):
+    key_i, key = random.split(key)
+    if 'lhs' in experiment:
+        logger.info('Sampling LHS')
+        with jax.default_device(cpu_device):
+            X = sample(lhs_parameter_space, train_samples, key_i)
+
+
+    if 'prior' in experiment:
+        logger.info('Sampling Prior')
+        with jax.default_device(cpu_device):
+            X = sample(prior_parameter_space, train_samples, key_i)
+
+    t_sample, y = timing(vmap(full_solution, in_axes=tla(X)))(*X)
+
+    if 'fixed' in experiment:
+        y = vmap(prev_stats, in_axes=[tla(y)])(y)
+
+    samples = (X, y)
+
+    logger.info('Making surrogates')
+
+    if 'full' in experiment:
+        surrogate_objs = make_surrogate_objects(samples, y_min_full, y_max_full)
+    else:
+        surrogate_objs = make_surrogate_objects(samples, y_min_fixed, y_max_fixed)
+
+    # Initialise SVI
+    if method == 'svi' or method == 'svi_annealed':
+        guide = AutoBNAFNormal(model, num_flows=5)
+        svi = SVI(
+            model,
+            guide,
+            optim.ClippedAdam(1e-4),
+            loss=Trace_ELBO(num_particles=8),
+        )
+        svi_state = None
+    if method == 'svi_annealed':
+        T = 1. / (0.45 ** jnp.arange(n_rounds))[::-1] 
+    else:
+        init_mcmc = [None] * len(experiments)
+
+    for r in range(n_rounds):
+        logger.info(f'Training surrogates: round {r}')
+        if train_samples > 10_000 and r > 0:
+            continue
+
+        desc = f'{train_samples}_{experiment}_{method}_round_{r}'
+        if os.path.exists(os.path.join(out_dir, f'{desc}_approx_error.csv')):
+            continue
+
+        key, key_i = random.split(key)
+
+        train_time, train_state = train_surrogate_objects(
+            key_i,
+            surrogate_objs,
+            samples
+        )
+
+        if 'full' in experiment:
+            val_helper = prev_stats_full_surrogate_posterior
+            impl = surrogate_impl_full
+        else:
+            val_helper = prev_stats_fixed_surrogate_posterior
+            impl = surrogate_impl_fixed
+
+        key, key_i = random.split(key)
+        if 'nuts' == method:
+            logger.info('Performing MCMC')
+            (
+                inf_time,
+                summary,
+                X_post,
+                y_post,
+                y_post_hat,
+                init_mcmc
+            ) = perform_mcmc(
+                key_i,
+                impl,
+                val_helper,
+                surrogate_objs,
+                train_state,
+                init_mcmc,
+                train_samples
+            )
+
+        if 'svi' == method or 'svi_annealed' == method:
+            if 'svi' == method:
+                alpha = 1.
+            else:
+                alpha = 1./T[r]
+            logger.info('Performing SVI')
+            (
+                inf_time,
+                X_post,
+                y_post,
+                y_post_hat,
+                svi_state,
+                svi_losses
+            ) = perform_svi(
+                key,
+                impl,
+                val_helper,
+                surrogate_objs,
+                train_state,
+                svi,
+                guide,
+                svi_state,
+                train_samples,
+                alpha
+            )
+
+        logger.info('Calculating validation data')
+        y_val_hat = val_helper(
+            surrogate_objs[0],
+            surrogate_objs[1],
+            train_state.params,
+            without_obs(prior)
+        )
+
+        logger.info('Writing results')
+        approximation_error(
+            [experiment] * 2,
+            ['prior', 'posterior'],
+            [y_val_prior, y_post],
+            [y_val_hat, y_post_hat]
+        ).assign(method=method).to_csv(
+            os.path.join(out_dir, f'{desc}_approx_error.csv'),
+            index=False
+        )
+
+        stand_approximation_error(
+            [experiment] * 2,
+            ['prior', 'posterior'],
+            [y_val_prior, y_post],
+            [y_val_hat, y_post_hat]
+        ).assign(method=method).to_csv(
+            os.path.join(out_dir, f'{desc}_stand_approx_error.csv'),
+            index=False
+        )
+
+        pd.DataFrame([{
+            'experiment': experiment,
+            'method': method,
+            'sampling': t_sample,
+            'training': train_time,
+            'inference': inf_time 
+        }]).to_csv(
+            os.path.join(out_dir, f'{desc}_timings.csv'),
+            index=False
+        )
+
+        logger.info('Writing likelihoods')
+        pp_ll_df(
+            key_i,
+            [X_post],
+            [experiment]
+        ).assign(method=method).to_csv(
+            os.path.join(out_dir, f'{desc}_pp_ll.csv'),
+            index=False
+        )
+
+        ll_df(
+            [X_post],
+            [experiment]
+        ).assign(method=method).to_csv(
+            os.path.join(out_dir, f'{desc}_ll.csv'),
+            index=False
+        )
+
+        logger.info('Writing KS Error')
+        sample_keys = list(posterior_samples.keys())
+
+        pd.DataFrame([
+            {
+                'experiment': experiment,
+                'method': method,
+                'variable': k,
+                'statistic': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(X_post[k], -1)).statistic,
+                'p-value': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(X_post[k], -1)).pvalue
+            }
+            for k in sample_keys
+        ]).to_csv(os.path.join(out_dir, f'{desc}_ks_error.csv'), index=False)
+
+        logger.info('Writing MMD')
+        pd.DataFrame([
+            {
+                'experiment': experiment,
+                'method': method,
+                'MMD': squared_mmd(
+                    vectorise_posterior(posterior_samples),
+                    vectorise_posterior(X_post)
+                )
+            }
+        ]).to_csv(os.path.join(out_dir, f'{desc}_mmd.csv'), index=False)
+
+        logger.info('Writing SVI losses')
+        if method == 'svi' or method == 'svi_annealed':
+            pd.DataFrame({
+                'loss': svi_losses[::1000],
+                'step': jnp.arange(0, len(svi_losses), 1000)
+            }).assign(experiment=experiment).to_csv(
+                os.path.join(out_dir, f'{desc}_svi_losses.csv'),
+                index=False
+            )
+        else:
+            logger.info('MCMC stats')
+            summary.assign(experiment=experiment).to_csv(
+                os.path.join(out_dir, f'{desc}_mcmc_summary.csv'),
+                index=False
+            )
+
+        if r != n_rounds - 1:
+            logger.info('Concatting samples')
+            if 'full' in experiment:
+                X_new, y_new = sample_full_from_posterior(X_post)
+            else:
+                X_new, y_new = sample_fixed_from_posterior(X_post)
+            samples = (
+                tree_map(lambda *x: jnp.concatenate(x), samples[0], X_new),
+                tree_map(lambda *y: jnp.concatenate(y), samples[1], y_new),
+            )
+
+
+runs = jnp.linspace(int(10), int(100), num=5, dtype=jnp.int64)
+
+for n_batches in runs:
+    train_samples = n_batches * 100
     experiments = [
         'lhs_full',
         'prior_full',
@@ -849,327 +1101,8 @@ def run_pipeline(train_samples, key):
         'prior_fixed'
     ]
 
-    methods = ['nuts', 'svi']
-
-    logger.info('Sampling LHS')
-    key_i, key = random.split(key)
-    with jax.default_device(cpu_device):
-        X_lhs_full = sample(lhs_parameter_space, train_samples, key_i)
-        t_sample_lhs, y_lhs_full = timing(vmap(full_solution, in_axes=[{n: 0 for n in intrinsic_bounds.name}, 0, 0]))(*X_lhs_full)
-        
-    X_lhs_fixed = X_lhs_full
-    y_lhs_fixed = vmap(prev_stats, in_axes=[tla(y_lhs_full)])(y_lhs_full)
-
-    logger.info('Sampling Prior')
-    key_i, key = random.split(key)
-    with jax.default_device(cpu_device):
-        X_prior_full = sample(prior_parameter_space, train_samples, key_i)
-        t_sample_prior, y_prior_full = timing(vmap(full_solution, in_axes=tree_map(lambda x: 0, X_prior_full)))(*X_prior_full)
-
-    X_prior_fixed = X_prior_full
-    y_prior_fixed = vmap(prev_stats, in_axes=[tla(y_prior_full)])(y_prior_full)
-
-    samples = [
-        (X_lhs_full, y_lhs_full),
-        (X_prior_full, y_prior_full),
-        (X_lhs_fixed, y_lhs_fixed),
-        (X_prior_fixed, y_prior_fixed)
-    ]
-
-    samples_mcmc = samples_svi = samples
-
-    logger.info('Making surrogates')
-
-    surrogates = [
-        make_surrogate_objects(s, y_min_full, y_max_full)
-        for s in samples[:2]
-    ] + [
-        make_surrogate_objects(s, y_min_fixed, y_max_fixed)
-        for s in samples[2:]
-    ]
-
-
-    # Initialise SVI
-    guide = AutoBNAFNormal(model, num_flows=5)
-    svi = SVI(
-        model,
-        guide,
-        optim.ClippedAdam(1e-4),
-        loss=Trace_ELBO(num_particles=8),
-    )
-
-    init_mcmc = [None] * len(experiments)
-    svi_states = [None] * len(experiments)
-
-    for r in range(n_rounds):
-        logger.info(f'Training surrogates: round {r}')
-        if train_samples > 5_000 and r > 0:
-            continue
-
-        key, *keys = random.split(key, len(experiments) + 1)
-
-        train_times, train_states_mcmc = zip(
-            *[
-                train_surrogate_objects(key, obj, s)
-                for key, obj, s
-                in zip(
-                    keys,
-                    surrogates,
-                    samples_mcmc
-                )
-            ]
-        )
-
-        if r == 0:
-            train_states_svi = train_states_mcmc
-        else:
-            _, train_states_svi = zip(
-                *[
-                    train_surrogate_objects(key, obj, s)
-                    for key, obj, s
-                    in zip(
-                        keys,
-                        surrogates,
-                        samples_svi
-                    )
-                ]
-            )
-
-        logger.info('Performing MCMC')
-        key, *keys = random.split(key, len(experiments) + 1)
-        val_helpers = [prev_stats_full_surrogate_posterior] * 2 + [prev_stats_fixed_surrogate_posterior] * 2
-        (
-            mcmc_times,
-            summaries,
-            X_post,
-            y_post,
-            y_post_hat,
-            init_mcmc
-        ) = zip(
-            *[
-                perform_mcmc(
-                    key,
-                    impl,
-                    val_helper,
-                    obj,
-                    state,
-                    init_sample,
-                    train_samples
-                )
-                for key, impl, val_helper, obj, state, init_sample
-                in zip(
-                    keys,
-                    [surrogate_impl_full] * 2 + [surrogate_impl_fixed] * 2,
-                    val_helpers,
-                    surrogates,
-                    train_states_mcmc,
-                    init_mcmc
-                )
-            ]
-        )
-
-        logger.info('Performing SVI')
-        key, *keys = random.split(key, len(experiments) + 1)
-        (
-            svi_times,
-            X_post_svi,
-            y_post_svi,
-            y_post_svi_hat,
-            svi_states,
-            svi_losses
-        ) = zip(
-            *[
-                perform_svi(
-                    key,
-                    impl,
-                    val_helper,
-                    obj,
-                    state,
-                    svi,
-                    guide,
-                    svi_state,
-                    train_samples
-                )
-                for key, impl, val_helper, obj, state, svi_state
-                in zip(
-                    keys,
-                    [surrogate_impl_full] * 2 + [surrogate_impl_fixed] * 2,
-                    val_helpers,
-                    surrogates,
-                    train_states_svi,
-                    svi_states
-                )
-            ]
-        )
-
-        logger.info('Calculating validation data')
-        y_val_mcmc = [
-            helper(
-                surrogate,
-                net,
-                state.params,
-                without_obs(prior)
-            )
-            for helper, (surrogate, net), state
-            in zip(val_helpers, surrogates, train_states_mcmc)
-        ]
-
-        y_val_svi = [
-            helper(
-                surrogate,
-                net,
-                state.params,
-                without_obs(prior)
-            )
-            for helper, (surrogate, net), state
-            in zip(val_helpers, surrogates, train_states_svi)
-        ]
-
-        logger.info('Writing results')
-        posts = [
-            (X_post, y_post, y_post_hat),
-            (X_post_svi, y_post_svi, y_post_svi_hat)
-        ]
-
-        vals = [
-            y_val_mcmc,
-            y_val_svi
-        ]
-
-        pd.concat([
-            approximation_error(
-                [exp for exp in experiments for _ in range(2)],
-                ['prior', 'posterior'] * len(experiments),
-                [truth for pair in zip([y_val_prior] * len(experiments), y_post_out) for truth in pair],
-                [hat for pair in zip(y_val_out, y_post_hat_out) for hat in pair]
-            ).assign(method=method)
-            for method, y_val_out, (_, y_post_out, y_post_hat_out) in zip(methods, vals, posts)
-        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_approx_error.csv'), index=False)
-
-        pd.concat([
-            stand_approximation_error(
-                [exp for exp in experiments for _ in range(2)],
-                ['prior', 'posterior'] * len(experiments),
-                [truth for pair in zip([y_val_prior] * len(experiments), y_post_out) for truth in pair],
-                [hat for pair in zip(y_val_out, y_post_hat_out) for hat in pair],
-                surrogates[2][0] # lhs_fixed surrogate for standardising
-            ).assign(method=method)
-            for method, y_val_out, (_, y_post_out, y_post_hat_out) in zip(methods, vals, posts)
-        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_stand_approx_error.csv'), index=False)
-
-        pd.DataFrame({
-            'experiment': experiments,
-            'sampling': [t_sample_prior, t_sample_prior, t_sample_lhs, t_sample_lhs],
-            'training': train_times,
-            'mcmc': mcmc_times,
-            'svi': svi_times 
-        }).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_timings.csv'), index=False)
-
-        logger.info('Writing likelihoods')
-        pd.concat([
-            pp_ll_df(
-                key_i,
-                X,
-                experiments
-            ).assign(method=method)
-            for method, (X, _, _) in zip(methods, posts)
-        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_pp_ll.csv'), index=False)
-
-        pd.concat([
-            ll_df(
-                X,
-                experiments
-            ).assign(method=method)
-            for method, (X, _, _) in zip(methods, posts)
-        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_ll.csv'), index=False)
-
-        logger.info('Writing KS Error')
-        sample_keys = list(posterior_samples.keys())
-
-        pd.concat([
-            pd.DataFrame([
-                {
-                    'experiment': name,
-                    'variable': k,
-                    'statistic': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(posterior[k], -1)).statistic,
-                    'p-value': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(posterior[k], -1)).pvalue
-                }
-                for k in sample_keys
-                for name, posterior in zip(experiments, X)
-            ]).assign(method=method)
-            for method, (X, _, _) in zip(methods, posts)
-        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_ks_error.csv'), index=False)
-
-        logger.info('Writing MMD')
-        pd.concat([
-            pd.DataFrame([
-                {
-                    'experiment': name,
-                    'MMD': squared_mmd(
-                        vectorise_posterior(posterior_samples),
-                        vectorise_posterior(posterior)
-                    )
-                }
-                for name, posterior in zip(experiments, X)
-            ]).assign(method=method)
-            for method, (X, _, _) in zip(methods, posts)
-        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_mmd.csv'), index=False)
-
-        logger.info('Writing SVI losses')
-        pd.concat([
-            pd.DataFrame({
-                'loss': losses[::1000],
-                'step': jnp.arange(0, len(losses), 1000)
-            }).assign(experiment=name)
-            for name, losses in zip(experiments, svi_losses)
-        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_svi_losses.csv'), index=False)
-
-        logger.info('MCMC stats')
-        pd.concat([
-            s.assign(experiment=name)
-            for name, s in zip(experiments, summaries)
-        ]).to_csv(os.path.join(out_dir, f'{train_samples}_round_{r}_mcmc_summary.csv'), index=False)
-
-        if r != n_rounds - 1:
-            logger.info('Concatting samples')
-            new_samples_mcmc = [
-                sample_full_from_posterior(X)
-                for X in X_post[:2]
-            ] + [
-                sample_fixed_from_posterior(X)
-                for X in X_post[2:]
-            ]
-            samples_mcmc = [
-                (
-                    tree_map(lambda *x: jnp.concatenate(x), X, X_new),
-                    tree_map(lambda *y: jnp.concatenate(y), y, y_new),
-                )
-                for ((X, y), (X_new, y_new))
-                in zip(samples_mcmc, new_samples_mcmc)
-            ]
-
-            new_samples_svi = [
-                sample_full_from_posterior(X)
-                for X in X_post_svi[:2]
-            ] + [
-                sample_fixed_from_posterior(X)
-                for X in X_post_svi[2:]
-            ]
-            samples_svi = [
-                (
-                    tree_map(lambda *x: jnp.concatenate(x), X, X_new),
-                    tree_map(lambda *y: jnp.concatenate(y), y, y_new),
-                )
-                for ((X, y), (X_new, y_new))
-                in zip(samples_svi, new_samples_svi)
-            ]
-
-runs = jnp.concatenate([
-    jnp.linspace(int(10), int(50), num=5, dtype=jnp.int64),
-    jnp.linspace(int(100), int(5e3), num=5, dtype=jnp.int64)
-])
-
-for n_batches in runs:
-    train_samples = n_batches * 100
-    logger.info(f'{train_samples} samples')
-    run_pipeline(train_samples, key)
+    methods = ['nuts', 'svi', 'svi_annealed']
+    for experiment in experiments:
+        for method in methods:
+            logger.info(f'{train_samples} samples - {experiment} - {method}')
+            run_pipeline(experiment, method, train_samples, key)
