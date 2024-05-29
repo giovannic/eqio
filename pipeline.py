@@ -271,14 +271,14 @@ intrinsic_bounds = pd.DataFrame.from_records([
     ('kb', 0, 10),
     ('ub', 0, 10),
     ('b0', 0, 1),
-    ('IB0', 0, 100),
+    ('IB0', 25, 75),
     ('kc', 0, 10),
     ('uc', 0, 10),
-    ('IC0', 0, 50),
+    ('IC0', 5, 50),
     ('phi0', 0, 1),
     ('phi1', 0, 1),
     ('PM', 0, 1),
-    ('dm', 0, 100),
+    ('dm', 5, 100),
     ('kd', min_val, 10),
     ('ud', 0, 10),
     ('d1', 0, 1),
@@ -900,7 +900,7 @@ def run_pipeline(experiment, method, train_samples, key):
             model,
             guide,
             optim.ClippedAdam(1e-4),
-            loss=Trace_ELBO(num_particles=8),
+            loss=Trace_ELBO(num_particles=128),
         )
         svi_state = None
     if method == 'svi_annealed':

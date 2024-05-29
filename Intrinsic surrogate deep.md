@@ -805,7 +805,7 @@ for i in range(len(EIRs)):
     for imm_i, imm in enumerate([f'prob_{l}' for l in imm_labels]):
         #axs[imm_i, i].plot(NUTS_posterior_curves[imm][i, :n_curves, :].T, color='r', alpha=.01)
         axs[imm_i, i].plot(SVI_posterior_curves[imm][i, :n_curves, :].T, color='g', alpha=.01)
-        axs[imm_i, i].plot(true_curves[imm][i, 0, :].T)
+        axs[imm_i, i].plot(true_curves[imm][i, 0, :].T, color='r')
         axs[imm_i, 0].set_ylabel(f'prob. {imm_labels[imm_i]}')
         
 fig.tight_layout()
@@ -823,7 +823,7 @@ for i in range(len(EIRs)):
         axs[0, i].xaxis.set_label_position('top')
         #axs[prev_i, i].plot(NUTS_posterior_curves[prev][i, :n_curves, :].T / NUTS_posterior_curves['prop'][i, :n_curves, :].T, color='r', alpha=.01)
         axs[prev_i, i].plot(SVI_posterior_curves[prev][i, :n_curves, :].T / SVI_posterior_curves['prop'][i, :n_curves, :].T, color='g', alpha=.01)
-        axs[prev_i, i].plot(true_curves[prev][i, 0, :] / true_curves['prop'][i, 0, :])
+        axs[prev_i, i].plot(true_curves[prev][i, 0, :] / true_curves['prop'][i, 0, :], color='r')
         axs[prev_i, 0].set_ylabel(prev)
         
 fig.tight_layout()
@@ -871,10 +871,14 @@ imm_labels = ['prob_b', 'prob_c', 'prob_d']
 for imm_i, imm in enumerate(imm_labels):
     #axs[imm_i].plot(posterior_imm_curves[imm][:n_curves, :].T, color='r', alpha=.1)
     axs[imm_i].plot(posterior_imm_curves_svi[imm][:n_curves, :].T, color='g', alpha=.1)
-    axs[imm_i].plot(true_imm_curves[imm][0, :])
+    axs[imm_i].plot(true_imm_curves[imm][0, :], color='r')
     axs[imm_i].set_ylabel(imm)
         
 fig.tight_layout()
 fig.text(0.5, 0, 'Exposures (number)', ha='center')
 fig.text(0.5, 1, 'Surrogate posterior immunity probability function', ha='center')
+```
+
+```{code-cell} ipython3
+
 ```

@@ -12,22 +12,17 @@ kernelspec:
   name: python3
 ---
 
-# TODO
-
- * MMD
- * Change pipeline to sample train size for rounds
- * Add annealing
-
 ```{code-cell} ipython3
 from glob import glob
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os.path
+import numpy as np
 ```
 
 ```{code-cell} ipython3
-base_dir = 'outputs/v3/'
+base_dir = 'outputs/v4/'
 ```
 
 ```{code-cell} ipython3
@@ -62,17 +57,17 @@ ks_error = pd.concat([
     for m in samplers
     for prop in props
 ])
+ks_error = ks_error.assign(null=np.where(ks_error['p-value'] < 0.1, 'reject', 'accept'))
 ```
 
 ```{code-cell} ipython3
 g = sns.FacetGrid(
-    ks_error,
-    col="samples",
-    row='sampler',
+    ks_error[ks_error['round'] == ks_error['round'].max()],
+    col="sampler",
     hue='proposal',
     margin_titles=True
 )
-g.map(sns.lineplot, "round", "statistic")
+g.map(sns.lineplot, "samples", "statistic")
 g.add_legend()
 ```
 
@@ -81,13 +76,14 @@ fig, ax = plt.subplots(figsize=(19.7, 8.27))
 sns.barplot(
     ks_error[
         (ks_error.samples == max(ks_error['samples'])) &
-        (ks_error['round'] == max(ks_error['round'])) &
-        (ks_error['sampler'] == 'svi_annealed')
+        (ks_error['round'] == max(rounds)) &
+        (ks_error['sampler'] == 'svi_annealed') &
+        (ks_error['experiment'] == 'prior_fixed')
         #ks_error.variable.isin(['b0', 'phi0', 'phi1'])
     ],
     x='variable',
     y='statistic',
-    hue='experiment',
+    hue='null',
     #estimator=lambda x: jnp.mean(jnp.abs(jnp.array(x))),
     #errorbar=('ci', 95),
     ax=ax
@@ -120,15 +116,79 @@ stand_approx_error = pd.concat([
 ```
 
 ```{code-cell} ipython3
+ax = sns.lineplot(
+    stand_approx_error[
+        (stand_approx_error.test_set == 'prior') &
+        (stand_approx_error['round'] == 0) & 
+        (stand_approx_error.mse < 1e10)
+    ],
+    x = 'samples',
+    y = 'mse',
+    hue = 'proposal'
+)
+```
+
+```{code-cell} ipython3
 g = sns.FacetGrid(
-    stand_approx_error,
-    row="test_set",
-    col="samples",
+    approx_error[
+        (approx_error.test_set == 'prior') &
+        (approx_error['round'] == 0) & 
+        (approx_error.mse < 1e10)
+    ],
+    col="output",
     hue="proposal",
     margin_titles=True,
-    sharey=False
+    sharey=True
 )
-g.map(sns.lineplot, "round", "mse")
+g.map(sns.lineplot, "samples", "mse")
+for ax in g.axes_dict.values():
+    ax.set_yscale('log')
+g.add_legend()
+```
+
+```{code-cell} ipython3
+ax = sns.lineplot(
+    stand_approx_error[
+        (stand_approx_error.test_set == 'prior') &
+        (stand_approx_error['samples'] == stand_approx_error['samples'].max()) &
+        (stand_approx_error.mse < 1e10)
+    ],
+    x = 'round',
+    y = 'mse',
+    hue = 'proposal'
+)
+ax.set_xticks(range(5))
+```
+
+```{code-cell} ipython3
+g = sns.FacetGrid(
+    stand_approx_error[
+        (stand_approx_error.test_set == 'posterior') &
+        (stand_approx_error['round'] == 4)
+    ],
+    col="sampler",
+    hue="proposal",
+    margin_titles=True,
+    sharey=True
+)
+g.map(sns.lineplot, "samples", "mse")
+g.add_legend()
+```
+
+```{code-cell} ipython3
+g = sns.FacetGrid(
+    approx_error[
+        (approx_error.test_set == 'posterior') &
+        (approx_error['round'] == 4) & 
+        (approx_error.mse < 1e10)
+    ],
+    col="output",
+    row='sampler',
+    hue="proposal",
+    margin_titles=True,
+    sharey=True
+)
+g.map(sns.lineplot, "samples", "mse")
 for ax in g.axes_dict.values():
     ax.set_yscale('log')
 g.add_legend()
@@ -136,17 +196,17 @@ g.add_legend()
 
 ```{code-cell} ipython3
 g = sns.FacetGrid(
-    approx_error[approx_error['round'] == 4],
-    row="test_set",
-    col="output",
+    stand_approx_error[
+        (stand_approx_error.test_set == 'posterior') &
+        (stand_approx_error['samples'] == stand_approx_error['samples'].max())
+    ],
+    col="sampler",
+    #row='sampler',
     hue="proposal",
     margin_titles=True,
-    sharey=False
+    sharey=True
 )
-g.map(sns.lineplot, "samples", "mse")
-for ax in g.axes_dict.values():
-    ax.tick_params(axis='x', labelrotation=45)
-    ax.set_yscale('log')
+g.map(sns.lineplot, "round", "mse")
 g.add_legend()
 ```
 
@@ -173,16 +233,35 @@ timings = pd.melt(
 ```
 
 ```{code-cell} ipython3
-sns.lineplot(
+g = sns.FacetGrid(
     timings[(timings.task.isin(['sampling', 'training'])) & (timings['round'] == 0)],
-    x="samples",
-    y="time",
-    hue='task'
+    col="task",
+    margin_titles=True,
+    sharey=False
 )
+g.map(sns.lineplot, "samples", "time")
+
+#sns.lineplot(
+#    timings[(timings.task.isin(['sampling'])) & (timings['round'] == 0)],
+#    x="samples",
+#    y="time",
+#    hue='task'
+#)
 ```
 
 ```{code-cell} ipython3
-sns.boxplot(timings[timings.task == 'inference'], x='sampler', y='time')
+fig, axes = plt.subplots(1, 2)
+for i, s in enumerate(['nuts', 'svi']):
+    sns.boxplot(
+        timings[
+            (timings.task == 'inference') & (timings.sampler == s)
+        ],
+        x='sampler',
+        y='time',
+        ax=axes[i]
+    )
+axes[1].set_ylabel('')
+fig.tight_layout()
 ```
 
 ```{code-cell} ipython3
@@ -223,19 +302,25 @@ ll = pd.melt(
 
 ```{code-cell} ipython3
 g = sns.FacetGrid(
-    ll[(ll.obs == 'obs_inc') & ll.proposal.isin(['prior_full', 'prior_fixed'])],
-    col='samples',
-    row="sampler",
-    hue="proposal",
+    ll[
+        #(ll.obs == 'obs_inc') &
+        #ll.proposal.isin(['prior_full', 'prior_fixed'])
+        (ll.samples == ll.samples.max()) &
+        #(ll['round'] == ll['round'].max()) &
+        (ll.proposal == 'prior_fixed')
+    ],
+    col='sampler',
+    #row="sampler",
+    #hue="proposal",
     margin_titles=True,
     sharey=False
 )
 g.map(sns.lineplot, "round", "log_likelihood")
-for (e, s), ax in g.axes_dict.items():
+for _, ax in g.axes_dict.items():
     #ax.set_yscale('log')
-    y = u_ll[u_ll.obs == 'obs_inc'].log_likelihood.iloc[0]
-    ax.axhline(y, 0, 4, ls='--')
-    #ax.fill_between(list(range(5)), y.min(), y.max(), color='black', alpha=.1)
+    y = u_ll.log_likelihood
+    ax.axhline(y.mean(), 0, 4, ls='--')
+    ax.fill_between(list(range(5)), y.min(), y.max(), color='black', alpha=.1)
 g.add_legend()
 ```
 
@@ -277,15 +362,16 @@ u_pp_ll = pd.melt(
 
 ```{code-cell} ipython3
 g = sns.FacetGrid(
-    pp_ll,
-    col='samples',
-    row="sampler",
-    hue="proposal",
+    pp_ll[
+        (pp_ll['samples']== pp_ll['samples'].max()) &
+        (pp_ll.proposal == 'prior_fixed')
+    ],
+    col='sampler',
     margin_titles=True,
     sharey=False
 )
 g.map(sns.lineplot, "round", "log_likelihood")
-for (e, s), ax in g.axes_dict.items():
+for _, ax in g.axes_dict.items():
     #ax.set_yscale('log')
     y = u_pp_ll.log_likelihood
     ax.axhline(y.mean(), 0, 4, ls='--')
@@ -312,23 +398,11 @@ summaries.n_eff = pd.to_numeric(summaries.n_eff)
 g = sns.FacetGrid(
     summaries,
     col='samples',
-    hue="proposal",
+    #hue="proposal",
     margin_titles=True,
     sharey=False
 )
 g.map(sns.lineplot, "round", "r_hat")
-g.add_legend()
-```
-
-```{code-cell} ipython3
-g = sns.FacetGrid(
-    summaries,
-    col='samples',
-    hue="proposal",
-    margin_titles=True,
-    sharey=False
-)
-g.map(sns.lineplot, "round", "n_eff")
 g.add_legend()
 ```
 
@@ -346,7 +420,10 @@ losses = pd.concat([
 
 ```{code-cell} ipython3
 g = sns.FacetGrid(
-    losses[losses['round'] == max(rounds)],
+    losses[
+        (losses['round'] == max(rounds)) &
+        (losses['step'] > 0)
+    ],
     col='samples',
     row='sampler',
     hue="proposal",
@@ -354,6 +431,8 @@ g = sns.FacetGrid(
     sharey=False
 )
 g.map(sns.lineplot, "step", "loss")
+#for ax in g.axes_dict.values():
+#    ax.set_yscale('log')
 g.add_legend()
 ```
 
