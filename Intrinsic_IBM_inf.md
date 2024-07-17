@@ -469,7 +469,10 @@ fig.text(0.5, 1, 'Estimated posterior immunity probability function', ha='center
 ```
 
 ```{code-cell} ipython3
-az.summary(inf, var_names=intrinsic, kind='stats')
+print(
+    az.summary(inf, var_names=intrinsic, kind='stats').reset_index().to_latex(
+        index=False, float_format="{:0.2f}".format)
+)
 ```
 
 ```{code-cell} ipython3
@@ -482,12 +485,12 @@ site_summ['inc_counts'] = [jnp.sum(site_data.inc_index == i) for i in range(len(
 ```
 
 ```{code-cell} ipython3
-site_summ.groupby('iso3c').agg(
+print(site_summ.groupby('iso3c').agg(
     {'name_1': len, 'prev_counts': 'sum', 'inc_counts': 'sum'}
 ).reset_index().rename(
     {'name_1': 'n_sites', 'prev_counts': 'prev_points', 'inc_counts': 'inc_points'},
     axis=1
-)
+).to_latex(index=False, float_format="{:0.0f}".format))
 ```
 
 ```{code-cell} ipython3

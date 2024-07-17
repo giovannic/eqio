@@ -56,6 +56,12 @@ ks_error = pd.concat([
     for r in rounds
     for m in samplers
     for prop in props
+] + [
+    pd.read_csv(
+        f'outputs/v7/{get_desc(100_000, "prior_full", m, r)}_ks_error.csv'
+    ).assign(samples=100_000, round=r, sampler=m, proposal="prior_full")
+    for r in rounds
+    for m in ['svi', 'svi_annealed'] 
 ])
 ks_error = ks_error.assign(null=np.where(ks_error['p-value'] < 0.1, 'reject', 'accept'))
 ```
@@ -78,7 +84,7 @@ sns.barplot(
         (ks_error.samples == max(ks_error['samples'])) &
         (ks_error['round'] == max(rounds)) &
         (ks_error['sampler'] == 'svi_annealed') &
-        (ks_error['experiment'] == 'prior_fixed')
+        (ks_error['experiment'] == 'prior_full')
         #ks_error.variable.isin(['b0', 'phi0', 'phi1'])
     ],
     x='variable',
@@ -273,6 +279,12 @@ ll = pd.concat([
     for r in rounds
     for m in samplers
     for prop in props
+]+ [
+    pd.read_csv(
+        f'outputs/v7/{get_desc(100_000, "prior_full", m, r)}_ll.csv'
+    ).assign(samples=100_000, round=r, sampler=m, proposal="prior_full")
+    for r in rounds
+    for m in ['svi', 'svi_annealed'] 
 ])
 ```
 
@@ -305,9 +317,9 @@ g = sns.FacetGrid(
     ll[
         #(ll.obs == 'obs_inc') &
         #ll.proposal.isin(['prior_full', 'prior_fixed'])
-        (ll.samples == ll.samples.max()) &
-        #(ll['round'] == ll['round'].max()) &
-        (ll.proposal == 'prior_fixed')
+        #(ll.samples == ll.samples.max()) &
+        (ll['round'] == ll['round'].max()) &
+        (ll.proposal == 'prior_full')
     ],
     col='sampler',
     #row="sampler",
@@ -315,7 +327,7 @@ g = sns.FacetGrid(
     margin_titles=True,
     sharey=False
 )
-g.map(sns.lineplot, "round", "log_likelihood")
+g.map(sns.lineplot, "samples", "log_likelihood")
 for _, ax in g.axes_dict.items():
     #ax.set_yscale('log')
     y = u_ll.log_likelihood
@@ -333,6 +345,12 @@ pp_ll = pd.concat([
     for r in rounds
     for m in samplers
     for prop in props
+]+ [
+    pd.read_csv(
+        f'outputs/v7/{get_desc(100_000, "prior_full", m, r)}_pp_ll.csv'
+    ).assign(samples=100_000, round=r, sampler=m, proposal="prior_full")
+    for r in rounds
+    for m in ['svi', 'svi_annealed'] 
 ])
 ```
 
@@ -363,14 +381,14 @@ u_pp_ll = pd.melt(
 ```{code-cell} ipython3
 g = sns.FacetGrid(
     pp_ll[
-        (pp_ll['samples']== pp_ll['samples'].max()) &
-        (pp_ll.proposal == 'prior_fixed')
+        (pp_ll['round']== pp_ll['round'].max()) &
+        (pp_ll.proposal == 'prior_full')
     ],
     col='sampler',
     margin_titles=True,
     sharey=False
 )
-g.map(sns.lineplot, "round", "log_likelihood")
+g.map(sns.lineplot, "samples", "log_likelihood")
 for _, ax in g.axes_dict.items():
     #ax.set_yscale('log')
     y = u_pp_ll.log_likelihood

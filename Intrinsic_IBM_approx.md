@@ -272,14 +272,14 @@ n_sll = jnp.sum(n_ll, axis=(1, 2))
 
 ```{code-cell} ipython3
 ranking = jnp.argsort(n_inc_sll)
-best_inc = ranking[:16]
-worst_inc = ranking[-16:]
+worst_inc = ranking[:16]
+best_inc = ranking[-16:]
 ranking = jnp.argsort(n_detect_sll)
-best_detect = ranking[:16]
-worst_detect = ranking[-16:]
+worst_detect = ranking[:16]
+best_detect = ranking[-16:]
 ranking = jnp.argsort(n_sll)
-best_n = ranking[:16]
-worst_n = ranking[-16:]
+worst_n = ranking[:16]
+best_n = ranking[-16:]
 ```
 
 ```{code-cell} ipython3
@@ -299,7 +299,7 @@ def plot_predictions(y, mu, log_sigma, mse, title):
         ax.plot(np.arange(len(y[i])), y[i])
         ax.plot(np.arange(len(mu[i])), mu[i])
         ax.fill_between(jnp.arange(len(mu[i])), lower, upper, color='orange', alpha=.1)
-        ax.set_title(f'mse:{mse[i]:.2f}')
+        ax.set_title(f'log likelihood:{mse[i]:.2f}')
         ax.get_xaxis().set_ticklabels([])
         ax.get_yaxis().set_ticklabels([])
 

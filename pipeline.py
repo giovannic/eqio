@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-out_dir = 'outputs/v3'
+out_dir = 'outputs/v7'
 
 def timing(f):
     def wrap(*args, **kw):
@@ -705,7 +705,12 @@ def make_surrogate_objects(samples, y_min, y_max):
 def train_surrogate_objects(key, surrogate_obj, samples):
     surrogate, net = surrogate_obj
     X, y = samples
-    params = init_surrogate(key, surrogate, net, X)
+    params = init_surrogate(
+        key,
+        surrogate,
+        net,
+        tree_map(lambda leaf: leaf[:1], X)
+    )
     return timing(train_surrogate)(
         X,
         y,
@@ -714,7 +719,8 @@ def train_surrogate_objects(key, surrogate_obj, samples):
         mse,
         key,
         params,
-        epochs=epochs
+        epochs=epochs,
+        vectorising_device=cpu_device
     )
 
 def perform_mcmc(
@@ -788,7 +794,10 @@ def perform_svi(
         n_samples,
         alpha
     )
-    y_post = prev_stats_posterior(X_post)
+
+    with jax.default_device(cpu_device):
+        y_post = prev_stats_posterior(X_post)
+
     y_post_hat = val_helper(
         surrogate,
         net,
@@ -879,10 +888,11 @@ def run_pipeline(experiment, method, train_samples, key):
         with jax.default_device(cpu_device):
             X = sample(prior_parameter_space, train_samples, key_i)
 
-    t_sample, y = timing(vmap(full_solution, in_axes=tla(X)))(*X)
+    with jax.default_device(cpu_device):
+        t_sample, y = timing(vmap(full_solution, in_axes=tla(X)))(*X)
 
-    if 'fixed' in experiment:
-        y = vmap(prev_stats, in_axes=[tla(y)])(y)
+        if 'fixed' in experiment:
+            y = vmap(prev_stats, in_axes=[tla(y)])(y)
 
     samples = (X, y)
 
@@ -910,8 +920,6 @@ def run_pipeline(experiment, method, train_samples, key):
 
     for r in range(n_rounds):
         logger.info(f'Training surrogates: round {r}')
-        if train_samples > 10_000 and r > 0:
-            continue
 
         desc = f'{train_samples}_{experiment}_{method}_round_{r}'
         if os.path.exists(os.path.join(out_dir, f'{desc}_approx_error.csv')):
@@ -1019,9 +1027,10 @@ def run_pipeline(experiment, method, train_samples, key):
         )
 
         logger.info('Writing likelihoods')
+        X_post_sample = tree_map(lambda leaf: leaf[:1000], X_post)
         pp_ll_df(
             key_i,
-            [X_post],
+            [X_post_sample],
             [experiment]
         ).assign(method=method).to_csv(
             os.path.join(out_dir, f'{desc}_pp_ll.csv'),
@@ -1029,7 +1038,7 @@ def run_pipeline(experiment, method, train_samples, key):
         )
 
         ll_df(
-            [X_post],
+            [X_post_sample],
             [experiment]
         ).assign(method=method).to_csv(
             os.path.join(out_dir, f'{desc}_ll.csv'),
@@ -1044,8 +1053,8 @@ def run_pipeline(experiment, method, train_samples, key):
                 'experiment': experiment,
                 'method': method,
                 'variable': k,
-                'statistic': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(X_post[k], -1)).statistic,
-                'p-value': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(X_post[k], -1)).pvalue
+                'statistic': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(X_post_sample[k], -1)).statistic,
+                'p-value': ks_2samp(jnp.reshape(posterior_samples[k], -1), jnp.reshape(X_post_sample[k], -1)).pvalue
             }
             for k in sample_keys
         ]).to_csv(os.path.join(out_dir, f'{desc}_ks_error.csv'), index=False)
@@ -1057,7 +1066,7 @@ def run_pipeline(experiment, method, train_samples, key):
                 'method': method,
                 'MMD': squared_mmd(
                     vectorise_posterior(posterior_samples),
-                    vectorise_posterior(X_post)
+                    vectorise_posterior(X_post_sample)
                 )
             }
         ]).to_csv(os.path.join(out_dir, f'{desc}_mmd.csv'), index=False)
@@ -1080,10 +1089,11 @@ def run_pipeline(experiment, method, train_samples, key):
 
         if r != n_rounds - 1:
             logger.info('Concatting samples')
-            if 'full' in experiment:
-                X_new, y_new = sample_full_from_posterior(X_post)
-            else:
-                X_new, y_new = sample_fixed_from_posterior(X_post)
+            with jax.default_device(cpu_device):
+                if 'full' in experiment:
+                    X_new, y_new = sample_full_from_posterior(X_post)
+                else:
+                    X_new, y_new = sample_fixed_from_posterior(X_post)
             samples = (
                 tree_map(lambda *x: jnp.concatenate(x), samples[0], X_new),
                 tree_map(lambda *y: jnp.concatenate(y), samples[1], y_new),
