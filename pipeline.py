@@ -25,6 +25,11 @@ from time import time
 import logging
 import os
 
+
+from numpyro import optim
+from numpyro.infer import SVI, Trace_ELBO
+from numpyro.infer.autoguide import AutoBNAFNormal
+
 logging.basicConfig(
     format='%(asctime)s.%(msecs)03d %(levelname)s %(module)s - %(funcName)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
@@ -32,7 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-out_dir = 'outputs/v7'
+out_dir = 'outputs/v10'
 
 def timing(f):
     def wrap(*args, **kw):
@@ -49,7 +54,9 @@ n_chains = 10
 epochs = 1000
 n_svi_train_samples = 50_000
 n_surrogate_warmup = 500
-n_rounds = 5
+n_rounds = 10
+
+T = 1. / (0.45 ** jnp.arange(n_rounds))[::-1]
 
 def full_solution(params, eir, eta):
     max_age = 99
@@ -152,10 +159,9 @@ def model(
     prev=None,
     inc=None,
     impl=lambda p, e, a: prev_stats_multisite(p, e, a, full_solution),
-    subsample_size=n_sites
+    subsample_size=n_sites,
+    alpha=1.
     ):
-    with numpyro.plate('sites', n_sites):
-        EIR = numpyro.sample('EIR', dist.Uniform(0., 500.), obs=true_EIRs)
     
     # Pre-erythrocytic immunity
     kb = numpyro.sample('kb', dist.LogNormal(0., .25))
@@ -209,14 +215,29 @@ def model(
         'ad0': ad0,
         'rU': ru
     }
-    
-    prev_stats, inc_stats = impl(x, EIR, etas)
-    
+
     with numpyro.plate(
-        'site_sample',
+        'sites',
+        n_sites
+        ):
+
+        EIR = numpyro.sample(
+            'EIR',
+            dist.Uniform(0., 1000.),
+            obs=None if true_EIRs is None else true_EIRs
+        )
+
+
+    prev_stats, inc_stats = impl(x, EIR, etas)
+
+    with numpyro.plate(
+        'data',
         n_sites,
         subsample_size=subsample_size
-        ) as ind:
+        ) as data_ind:
+        ind = data_ind
+
+    with numpyro.handlers.scale(scale=alpha * (n_sites / subsample_size)):
         numpyro.sample(
             'obs_prev',
             dist.Independent(
@@ -227,7 +248,7 @@ def model(
                 ),
                 2
             ),
-            obs=prev
+            obs=None if prev is None else prev[ind]
         )
 
         numpyro.sample(
@@ -241,7 +262,7 @@ def model(
                 ),
                 2
             ),
-            obs=inc
+            obs=None if inc is None else inc[ind]
         )
 
 
@@ -250,11 +271,14 @@ key, key_i = random.split(key)
 true_values = Predictive(model, num_samples=1)(key_i, true_EIRs=EIRs)
 
 
-obs_inc, obs_prev = (true_values['obs_inc'], true_values['obs_prev'])
+obs_inc, obs_prev = (true_values['obs_inc'][0], true_values['obs_prev'][0])
 
+from functools import partial
+
+guide = AutoBNAFNormal(model, num_flows=5)
 
 print(pd.DataFrame(
-    jnp.vstack([EIRs, etas, obs_prev[0].T, obs_inc[0].T]).T,
+    jnp.vstack([EIRs, etas, obs_prev.T, obs_inc.T]).T,
     columns=['EIR', 'eta', 'prev_2_10', 'prev_10+', 'inc_0_5', 'inc_5_15', 'inc_15+']
 ).to_latex(index=False))
 
@@ -538,10 +562,6 @@ def surrogate_posterior(key, impl, init_params, n_samples):
     )
     return mcmc
 
-from numpyro import optim
-from numpyro.infer import SVI, Trace_ELBO
-from numpyro.infer.autoguide import AutoBNAFNormal
-
 def wo_latent(X):
     return {
         k: v
@@ -549,7 +569,7 @@ def wo_latent(X):
         if k != '_auto_latent'
     }
 
-def surrogate_posterior_svi(key, svi, guide, svi_state, impl, n_samples, subsample_size):
+def surrogate_posterior_svi(key, svi, guide, svi_state, impl, n_samples, subsample_size, alpha):
     # train SVI
     sample_key, key = random.split(key, 2)
     svi_result = svi.run(
@@ -561,7 +581,8 @@ def surrogate_posterior_svi(key, svi, guide, svi_state, impl, n_samples, subsamp
         prev=obs_prev,
         inc=obs_inc,
         impl=impl,
-        subsample_size=subsample_size
+        subsample_size=subsample_size,
+        alpha=alpha
     )
     svi_params = svi_result.params
 
@@ -733,7 +754,7 @@ def train_surrogate_objects(key, surrogate_obj, samples):
         key,
         params,
         epochs=epochs,
-        vectorising_device=cpu_device
+        #vectorising_device=cpu_device
     )
 
 def perform_mcmc(
@@ -791,7 +812,8 @@ def perform_svi(
     guide,
     svi_state,
     n_samples,
-    subsample_size
+    subsample_size,
+    alpha
     ):
     surrogate, net = obj
     t, (X_post, svi_state, losses) = timing(surrogate_posterior_svi)(
@@ -805,7 +827,8 @@ def perform_svi(
             train_state.params
         ),
         n_samples,
-        subsample_size
+        subsample_size,
+        alpha
     )
 
     with jax.default_device(cpu_device):
@@ -868,7 +891,7 @@ class SquaredExponential:
         return k
 
 
-def squared_mmd(X, Y, kernel=SquaredExponential(10., 1.)): 
+def squared_mmd(X, Y, kernel=SquaredExponential(1., 1.)): 
     X = jnp.array(X)
     Y = jnp.array(Y)
     K_XX = kernel(X, X)
@@ -889,58 +912,59 @@ def squared_mmd(X, Y, kernel=SquaredExponential(10., 1.)):
     return mmd_squared
 
 import numpy as np
-from sklearn.linear import LogisticRegression
-from sklearn.metrics import hamming_loss
-from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import KFold, cross_val_score
 from scipy import stats
 
-# from oddskool: https://gist.github.com/oddskool/409018f61d432f10fe00223e2b93cb51
-def c2st(X, y, clf=LogisticRegression(), loss=hamming_loss, bootstraps=300):
+# From SBIBM
+def c2st(
+    X,
+    Y,
+    seed: int = 1,
+    n_folds: int = 5,
+    scoring: str = "accuracy",
+    z_score: bool = True,
+):
+    """Classifier-based 2-sample test returning accuracy
+
+    Trains classifiers with N-fold cross-validation [1]. Scikit learn MLPClassifier are
+    used, with 2 hidden layers of 10x dim each, where dim is the dimensionality of the
+    samples X and Y.
+
+    Args:
+        X: Sample 1
+        Y: Sample 2
+        seed: Seed for sklearn
+        n_folds: Number of folds
+        z_score: Z-scoring using X
     """
-    Perform Classifier Two Sample Test (C2ST) [1].
+    if z_score:
+        X_mean = jnp.mean(X, axis=0)
+        X_std = jnp.std(X, axis=0)
+        X = (X - X_mean) / X_std
+        Y = (Y - X_mean) / X_std
 
-    This test estimates if a target is predictable from features by comparing the loss of a classifier learning 
-    the true target with the distribution of losses of classifiers learning a random target with the same average.
+    ndim = X.shape[1]
 
-    The null hypothesis is that the target is independent of the features - therefore the loss a classifier learning 
-    to predict the target should not be different from the one of a classifier learning independent, random noise.
-
-    Input:
-            - `X` : (n,m) matrix of features
-            - `y` : (n,) vector of target - for now only supports binary target
-            - `clf` : instance of sklearn compatible classifier (default: `LogisticRegression`)
-            - `loss` : sklearn compatible loss function (default: `hamming_loss`)
-            - `bootstraps` : number of resamples for generating the loss scores under the null hypothesis
-
-    Return: (
-            loss value of classifier predicting `y`, 
-            p-value of the test
+    clf = MLPClassifier(
+        activation="relu",
+        hidden_layer_sizes=(10 * ndim, 10 * ndim),
+        max_iter=10000,
+        solver="adam",
+        random_state=seed,
     )
 
-    Usage:
-        >>> emp_loss, random_losses, pvalue = c2st(X, y)
+    data = np.concatenate((X, Y))
+    target = np.concatenate(
+        (
+            np.zeros((X.shape[0],)),
+            np.ones((Y.shape[0],)),
+        )
+    )
 
-    Plotting H0 and target loss:
-    >>>bins, _, __ = plt.hist(random_losses)
-    >>>med = np.median(random_losses)
-    >>>plt.plot((med,med),(0, max(bins)), 'b')
-    >>>plt.plot((emp_loss,emp_loss),(0, max(bins)), 'r--')
-
-    [1] Lopez-Paz, D., & Oquab, M. (2016). Revisiting classifier two-sample tests. arXiv preprint arXiv:1610.06545.
-    """
-    X_train, X_test, y_train, y_test = train_test_split(X, y)
-    y_pred = clf.fit(X_train, y_train).predict(X_test)
-    emp_loss = loss(y_test, y_pred)
-    bs_losses = []
-    y_bar = np.mean(y)
-    for _ in range(bootstraps+1):
-        y_random = np.random.binomial(1, y_bar, size=y.shape[0])
-        X_train, X_test, y_train, y_test = train_test_split(X, y_random)
-        y_pred_bs = clf.fit(X_train, y_train).predict(X_test)
-        bs_losses += [loss(y_test, y_pred_bs)]
-    pc = stats.percentileofscore(sorted(bs_losses), emp_loss) / 100.
-    pvalue = pc if pc < y_bar else 1 - pc
-    return {'emp_loss': emp_loss, 'pvalue': pvalue}
+    shuffle = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    scores = cross_val_score(clf, data, target, cv=shuffle, scoring=scoring)
+    return jnp.mean(scores)
 
 def run_pipeline(experiment, method, train_samples, key):
     key_i, key = random.split(key)
@@ -971,13 +995,17 @@ def run_pipeline(experiment, method, train_samples, key):
         surrogate_objs = make_surrogate_objects(samples, y_min_fixed, y_max_fixed)
 
     # Initialise SVI
-    if method == 'svi' or method == 'svi_ss':
+    if 'svi' in method:
+        if 'svi_ss' == method:
+            subsample_size = 2
+        else:
+            subsample_size = n_sites
         guide = AutoBNAFNormal(model, num_flows=5)
         svi = SVI(
             model,
             guide,
             optim.ClippedAdam(1e-4),
-            loss=Trace_ELBO(num_particles=128),
+            loss=Trace_ELBO(num_particles=128)
         )
         svi_state = None
     else:
@@ -987,6 +1015,7 @@ def run_pipeline(experiment, method, train_samples, key):
         logger.info(f'Training surrogates: round {r}')
 
         desc = f'{train_samples}_{experiment}_{method}_round_{r}'
+
         if os.path.exists(os.path.join(out_dir, f'{desc}_approx_error.csv')):
             continue
 
@@ -1025,11 +1054,11 @@ def run_pipeline(experiment, method, train_samples, key):
                 train_samples
             )
 
-        if 'svi' == method or 'svi_ss' == method:
-            if 'svi' == method:
-                subsample_size = n_sites
+        if 'svi' in method:
+            if 'svi_annealed' == method:
+                alpha = 1. / T[r]
             else:
-                subsample_size = 2
+                alpha = 1.
             logger.info('Performing SVI')
             (
                 inf_time,
@@ -1048,7 +1077,8 @@ def run_pipeline(experiment, method, train_samples, key):
                 guide,
                 svi_state,
                 train_samples,
-                subsample_size
+                subsample_size,
+                alpha
             )
 
         logger.info('Calculating validation data')
@@ -1141,7 +1171,7 @@ def run_pipeline(experiment, method, train_samples, key):
             {
                 'experiment': experiment,
                 'method': method,
-                **c2st(
+                'c2st': c2st(
                     vectorise_posterior(X_post_sample),
                     vectorise_posterior(posterior_samples)
                 )
@@ -1149,7 +1179,7 @@ def run_pipeline(experiment, method, train_samples, key):
         ]).to_csv(os.path.join(out_dir, f'{desc}_c2st.csv'), index=False)
 
         logger.info('Writing SVI losses')
-        if method == 'svi' or method == 'svi_ss':
+        if 'svi' in method:
             pd.DataFrame({
                 'loss': svi_losses[::1000],
                 'step': jnp.arange(0, len(svi_losses), 1000)
@@ -1177,7 +1207,7 @@ def run_pipeline(experiment, method, train_samples, key):
             )
 
 
-runs = jnp.linspace(int(10), int(100), num=5, dtype=jnp.int64)
+runs = jnp.linspace(int(1), int(100), num=5, dtype=jnp.int64)
 
 for n_batches in runs:
     train_samples = n_batches * 100
@@ -1188,7 +1218,7 @@ for n_batches in runs:
         'prior_fixed'
     ]
 
-    methods = ['nuts', 'svi', 'svi_ss']
+    methods = ['nuts', 'svi', 'svi_annealed']
     for experiment in experiments:
         for method in methods:
             logger.info(f'{train_samples} samples - {experiment} - {method}')

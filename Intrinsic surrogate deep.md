@@ -755,12 +755,12 @@ def plot_predictive_error(y, y_hat):
     y_hat = jnp.concatenate(y_hat, axis=2)
     
     for i in range(5):
-        axs[i, 0].set_ylabel(y_labels[i])
+        #axs[i, 0].set_ylabel(y_labels[i])
         for j in range(len(EIRs)):
-            axs[0, j].set_xlabel(
-                f'EIR: {EIRs[j]}'
-            )
-            axs[0, j].xaxis.set_label_position('top')
+            #axs[0, j].set_xlabel(
+            #    f'EIR: {EIRs[j]}'
+            #)
+            #axs[0, j].xaxis.set_label_position('top')
             axs[i, j].plot(
                 y[:,j,i],
                 y_hat[:,j,i],
@@ -775,7 +775,7 @@ def plot_predictive_error(y, y_hat):
 
     fig.tight_layout()
 
-    fig.text(0.5, 0, 'Predictive error', ha='center')
+    #fig.text(0.5, 0, 'Predictive error', ha='center')
 ```
 
 ```{code-cell} ipython3
