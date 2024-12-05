@@ -47,7 +47,7 @@ sample = load_samples(
 ```
 
 ```{code-cell} ipython3
-surrogate, net, params = load_rnn('../fastms/rnn_6/', sample)
+surrogate, net, params = load_rnn('../fastms/rnn_6_annealed_4/', sample)
 ```
 
 ```{code-cell} ipython3
@@ -236,7 +236,7 @@ fig.tight_layout()
 ```
 
 ```{code-cell} ipython3
-inf = az.from_netcdf('../fastms/bnaf_rnn_6')
+inf = az.from_netcdf('../fastms/bnaf_rnn_6_annealed_4')
 ```
 
 ```{code-cell} ipython3
@@ -466,6 +466,13 @@ fig.tight_layout()
 legend_without_duplicate_labels(axs[-1])
 fig.text(0.5, 0, 'Exposures (number)', ha='center')
 fig.text(0.5, 1, 'Estimated posterior immunity probability function', ha='center')
+```
+
+```{code-cell} ipython3
+print(
+    az.summary(inf, kind='stats').reset_index().to_latex(
+        index=False, float_format="{:0.2f}".format)
+)
 ```
 
 ```{code-cell} ipython3

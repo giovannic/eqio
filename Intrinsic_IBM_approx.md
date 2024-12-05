@@ -56,7 +56,7 @@ first_sample = ((x, x_seq, x_t), y)
 ```
 
 ```{code-cell} ipython3
-surrogate, net, params = load_rnn('../fastms/rnn_6/', first_sample)
+surrogate, net, params = load_rnn('../fastms/rnn_6_annealed_5/', first_sample)
 ```
 
 ```{code-cell} ipython3
@@ -298,7 +298,7 @@ def plot_predictions(y, mu, log_sigma, mse, title):
         ax = axs[i // 4, i % 4]
         ax.plot(np.arange(len(y[i])), y[i])
         ax.plot(np.arange(len(mu[i])), mu[i])
-        ax.fill_between(jnp.arange(len(mu[i])), lower, upper, color='orange', alpha=.1)
+        ax.fill_between(jnp.arange(len(mu[i])), lower, upper, color='orange', alpha=.5)
         ax.set_title(f'log likelihood:{mse[i]:.2f}')
         ax.get_xaxis().set_ticklabels([])
         ax.get_yaxis().set_ticklabels([])
@@ -371,9 +371,9 @@ plot_predictions(
 #Surrogate posterior approximation error
 
 #with jax.default_device(cpu_device):
-defpath = '/mnt/gc1610/home/fastms/data/samples/bnaf_rnn_6/def_bnaf_rnn_6'
+defpath = '/mnt/gc1610/home/fastms/data/samples/bnaf_rnn_6_annealed_5/def_bnaf_rnn_6'
 paths = [
-    f'/mnt/gc1610/home/fastms/data/samples/bnaf_rnn_6/bnaf_rnn_6_{x}.npz'
+    f'/mnt/gc1610/home/fastms/data/samples/bnaf_rnn_6_annealed_5/bnaf_rnn_6_{x}.npz'
     for x in range(0, 1000)
 ]
 with open(defpath, 'rb') as f:
@@ -393,6 +393,61 @@ post_mu, post_log_sigma = apply_rnn(surrogate, net, params, (post_x, post_x_seq)
 ```
 
 ```{code-cell} ipython3
+post_n_inc_ll = log_likelihood(
+    post_mu['n_inc_clinical'],
+    post_log_sigma['n_inc_clinical'],
+    post_y['n_inc_clinical']
+)
+post_n_detect_ll = log_likelihood(
+    post_mu['n_detect'],
+    post_log_sigma['n_detect'],
+    post_y['n_detect']
+)
+post_n_ll = log_likelihood(
+    post_mu['n'],
+    post_log_sigma['n'],
+    post_y['n']
+)
+```
+
+```{code-cell} ipython3
+fig, axs = plt.subplots(nrows=1, ncols=3, figsize=(15,5))
+plots = [
+    {
+        'x': n_inc_ll,
+        'post': post_n_inc_ll,
+        'title': 'Likelihood of true incidence'
+    },
+    {
+        'x': n_detect_ll,
+        'post': post_n_detect_ll,
+        'title': 'Likelihood of true prevalence'
+    },
+    {
+        'x': n_ll,
+        'post': post_n_ll,
+        'title': 'Likelihood of true pop counts'
+    }
+]
+x_labels=['prior', 'posterior']
+
+for i in range(3):
+    ax = axs[i]
+    ax.boxplot(
+        jnp.stack([
+            plots[i]['x'].reshape(-1),
+            plots[i]['post'].reshape(-1),
+        ]),
+        showfliers=False,
+        labels=x_labels
+    )
+    if i == 0:
+        ax.set_ylabel('Surrogate log likelihood')
+    ax.set_xlabel('Validation set')
+    ax.set_title(plots[i]['title'])
+```
+
+```{code-cell} ipython3
 post_n_inc_se = squared_error(
     post_mu['n_inc_clinical'],
     post_y['n_inc_clinical']
@@ -408,22 +463,29 @@ post_n_se = squared_error(
 ```
 
 ```{code-cell} ipython3
+jnp.mean(n_inc_se, axis=(1,2)).shape
+```
+
+```{code-cell} ipython3
 fig, axs = plt.subplots(nrows=1, ncols=3, figsize=(15,5))
+def agg(x):
+    return jnp.mean(x, axis=(1,2))
+
 plots = [
     {
-        'x': n_inc_se,
-        'post': post_n_inc_se,
-        'title': 'Approx. error of incidence'
+        'x': agg(n_inc_se),
+        'post': agg(post_n_inc_se),
+        'title': 'Likelihood of true incidence'
     },
     {
-        'x': n_detect_se,
-        'post': post_n_detect_se,
-        'title': 'Approx. error of prevalence'
+        'x': agg(n_detect_se),
+        'post': agg(post_n_detect_se),
+        'title': 'Likelihood of true prevalence'
     },
     {
-        'x': n_se,
-        'post': post_n_se,
-        'title': 'Approx. error of pop counts'
+        'x': agg(n_se),
+        'post': agg(post_n_se),
+        'title': 'Likelihood of true pop counts'
     }
 ]
 x_labels=['prior', 'posterior']
@@ -433,37 +495,53 @@ for i in range(3):
     ax.boxplot(
         jnp.stack([
             plots[i]['x'].reshape(-1),
-            plots[i]['post'].reshape(-1)
+            plots[i]['post'].reshape(-1),
         ]),
         showfliers=False,
         labels=x_labels
     )
     if i == 0:
-        ax.set_ylabel('Mean squared error')
+        ax.set_ylabel('Surrogate log likelihood')
     ax.set_xlabel('Validation set')
     ax.set_title(plots[i]['title'])
 ```
 
 ```{code-cell} ipython3
-#defpath = '/mnt/gc1610/home/fastms/data/samples/bnaf_ss10_v2_round_1/def_bnaf_ss10_v2_round_1'
-#paths = [
-#    f'/mnt/gc1610/home/fastms/data/samples/bnaf_ss10_v2_round_1/bnaf_ss10_v2_round_1_{x}.npz'
-#    for x in range(10000)
-#]
-#with open(defpath, 'rb') as f:
-#    treedef = pickle.load(f)
-#p_pickles = [
-#    load_pytree(treedef, path, jnp.float64)
-#    for path in paths
-#]
+import jax
+jax.config.update('jax_enable_x64', True)
 
-#from jax.tree_util import tree_map
-#with jax.default_device(cpu_device):
-#    posterior_samples = tree_map(lambda *leaves: jnp.concatenate(leaves), *p_pickles)
+import pickle
+from jax.tree_util import tree_map
+from fastms.sample.save import save_compressed_pytree, load_pytree
+from jax import numpy as jnp
+cpu_device = jax.devices('cpu')[0]
 
-#from fastms.sample.save import save_compressed_pytree
-#save_compressed_pytree(
-#    posterior_samples[0],
-#    '/mnt/gc1610/home/fastms/data/samples/bnaf_ss10_v2_round_1_train.npz'
-#)
+
+defpath = '/mnt/gc1610/home/fastms/data/samples/bnaf_rnn_6_annealed_4/def_bnaf_rnn_6'
+paths = [
+    f'/mnt/gc1610/home/fastms/data/samples/bnaf_rnn_6_annealed_4/bnaf_rnn_6_{x}.npz'
+    for x in range(10000)
+]
+with open(defpath, 'rb') as f:
+    treedef = pickle.load(f)
+    
+with jax.default_device(cpu_device):
+    p_pickles = [
+        load_pytree(treedef, path, jnp.float64)
+        for path in paths
+    ]
+```
+
+```{code-cell} ipython3
+with jax.default_device(cpu_device):
+    posterior_samples = tree_map(lambda *leaves: jnp.concatenate(leaves), *p_pickles)
+
+save_compressed_pytree(
+    posterior_samples[0],
+    '/mnt/gc1610/home/fastms/data/samples/bnaf_6_annealed_4_train.npz'
+)
+```
+
+```{code-cell} ipython3
+
 ```
